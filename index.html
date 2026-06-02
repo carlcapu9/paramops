@@ -271,18 +271,16 @@ body {
   margin: 0 auto;
 }
 .sample-row {
-  display: grid;
-  grid-template-columns: 35fr 65fr;
-  gap: 40px;
-  align-items: center;
-  padding: 32px 0;
+  display: block;
+  padding: 36px 0;
   border-top: 1px solid var(--line);
 }
 .sample-row:first-of-type { border-top: 1px solid var(--line); }
-.sample-row.reverse { grid-template-columns: 65fr 35fr; }
-.sample-row.reverse .sample-text { order: 2; }
-.sample-row.reverse .sample-media { order: 1; }
-.sample-text { padding: 0 8px; }
+.sample-text {
+  padding: 0 4px;
+  margin-bottom: 20px;
+  max-width: 760px;
+}
 .sample-label {
   font-family: 'Geist Mono', monospace;
   font-size: 12px;
@@ -294,7 +292,7 @@ body {
   letter-spacing: -0.02em;
   font-weight: 700;
   color: var(--ink);
-  margin-bottom: 14px;
+  margin-bottom: 12px;
 }
 .sample-name .accent { color: var(--accent); }
 .sample-desc {
@@ -305,10 +303,11 @@ body {
 }
 .sample-desc strong { color: var(--ink); font-weight: 600; }
 .sample-media {
+  width: 100%;
   background: var(--bg-deep);
   border: 1px solid var(--line);
   aspect-ratio: 16 / 9;
-  border-radius: 10px;
+  border-radius: 12px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -360,9 +359,7 @@ body {
 }
 @media (max-width: 720px) {
   .samples-frame { padding: 36px 24px 32px; }
-  .sample-row { grid-template-columns: 1fr; gap: 20px; }
-  .sample-row.reverse .sample-text { order: 1; }
-  .sample-row.reverse .sample-media { order: 2; }
+  .sample-row { padding: 28px 0; }
 }
 /* ─── INTERACTIVE: Scroll-revealed animations ─── */
 .reveal {
@@ -385,35 +382,9 @@ body {
 
 /* ─── INTERACTIVE: Sticky shrinking wordmark ─── */
 .wordmark-sticky-wrapper {
-  position: sticky;
-  top: 0;
-  z-index: 50;
-  background: rgba(22, 23, 25, 0);
-  backdrop-filter: blur(0px);
-  -webkit-backdrop-filter: blur(0px);
-  transition: background 0.4s ease, backdrop-filter 0.4s ease, padding 0.4s ease;
-  padding: 0;
+  position: relative;
   margin: 0 -36px;
   padding: 0 36px;
-}
-.wordmark-sticky-wrapper.shrunk {
-  background: rgba(22, 23, 25, 0.85);
-  backdrop-filter: blur(14px);
-  -webkit-backdrop-filter: blur(14px);
-  border-bottom: 1px solid var(--line);
-}
-.wordmark {
-  transition: font-size 0.5s cubic-bezier(0.16, 1, 0.3, 1), margin-bottom 0.5s cubic-bezier(0.16, 1, 0.3, 1), padding 0.5s ease;
-}
-.wordmark-sticky-wrapper.shrunk .wordmark {
-  font-size: clamp(28px, 4vw, 36px);
-  margin-bottom: 0;
-  padding: 14px 0;
-}
-.wordmark-sticky-wrapper.shrunk .wordmark .dot {
-  top: clamp(-8px, -1vw, -14px);
-  width: clamp(6px, 0.8vw, 10px);
-  height: clamp(6px, 0.8vw, 10px);
 }
 
 /* ─── Sample media (no hover effects, for performance) ─── */
@@ -1127,16 +1098,6 @@ body {
 <div class="bg-gradient-blob"></div>
 <div class="bg-gradient-blob"></div>
 
-<!-- Vertical scroll curve -->
-<div class="scroll-curve">
-  <svg viewBox="0 0 40 800" preserveAspectRatio="none">
-    <path id="scrollCurvePath" class="curve-line"
-          d="M 20 0 Q 30 100, 20 200 T 20 400 T 20 600 T 20 800"
-          pathLength="1000"></path>
-    <circle id="scrollCurveDot" class="curve-dot" cx="20" cy="0" r="4"></circle>
-  </svg>
-</div>
-
 <div class="product">
 
   <!-- ─── Top wordmark (sticky shrinking) ─── -->
@@ -1426,35 +1387,9 @@ body {
   }, { threshold: 0.3 });
   document.querySelectorAll('.char-reveal').forEach(el => charIO.observe(el));
 
-  // ─── 2. Sticky shrinking wordmark ───
-  const sticky = document.getElementById('wordmarkSticky');
-  const onScroll = () => {
-    const y = window.scrollY;
-    if (y > 80) sticky.classList.add('shrunk');
-    else sticky.classList.remove('shrunk');
-  };
-  window.addEventListener('scroll', onScroll, { passive: true });
-  onScroll();
+  // ─── 2. (removed: sticky shrinking wordmark) ───
 
-  // ─── 3. Lateral scroll curve progress ───
-  const scrollPath = document.getElementById('scrollCurvePath');
-  const scrollDot = document.getElementById('scrollCurveDot');
-  function updateScrollCurve() {
-    if (!scrollPath) return;
-    const doc = document.documentElement;
-    const scrollable = doc.scrollHeight - window.innerHeight;
-    const progress = scrollable > 0 ? Math.min(1, Math.max(0, window.scrollY / scrollable)) : 0;
-    scrollPath.style.strokeDashoffset = 1000 * (1 - progress);
-    try {
-      const len = scrollPath.getTotalLength();
-      const pt = scrollPath.getPointAtLength(len * progress);
-      scrollDot.setAttribute('cx', pt.x);
-      scrollDot.setAttribute('cy', pt.y);
-    } catch (e) {}
-  }
-  window.addEventListener('scroll', updateScrollCurve, { passive: true });
-  window.addEventListener('resize', updateScrollCurve);
-  updateScrollCurve();
+  // ─── 3. (removed: lateral scroll curve progress) ───
 
   // ─── 4. (removed: hover glow follow-mouse on sample media) ───
 
