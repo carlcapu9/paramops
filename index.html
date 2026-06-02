@@ -582,6 +582,55 @@ body {
   opacity: 0.55;
 }
 
+/* ─── Scene showcase images ─── */
+.scene-showcase {
+  max-width: 1080px;
+  margin: 0 auto 72px;
+}
+.scene-showcase.scene-hero { margin-top: 8px; }
+.scene-figure {
+  position: relative;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--bg-deep);
+  box-shadow: 0 30px 80px -30px rgba(0,0,0,0.6);
+}
+.scene-figure img {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+.scene-figure.square {
+  max-width: 720px;
+  margin: 0 auto;
+}
+.scene-caption {
+  text-align: center;
+  margin-top: 16px;
+  font-size: 13px;
+  color: var(--ink-soft);
+  font-weight: 500;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+.scene-caption::before {
+  content: "✓";
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: rgba(90, 143, 214, 0.15);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 700;
+}
+.scene-caption .accent { color: var(--accent); font-weight: 600; }
+
 /* ─── Sample media videos + multi-video switcher ─── */
 .sample-media video {
   position: absolute;
@@ -753,9 +802,9 @@ body {
 .preset-marquee {
   position: relative;
   width: calc(100% + 88px);
-  margin: 32px -44px 28px;
+  margin: 18px -44px 14px;
   overflow: hidden;
-  padding: 4px 0;
+  padding: 26px 0;
   mask-image: linear-gradient(90deg, transparent 0%, black 6%, black 94%, transparent 100%);
   -webkit-mask-image: linear-gradient(90deg, transparent 0%, black 6%, black 94%, transparent 100%);
 }
@@ -763,7 +812,7 @@ body {
   display: flex;
   gap: 16px;
   width: max-content;
-  animation: preset-marquee 90s linear infinite;
+  animation: preset-marquee 50s linear infinite;
   will-change: transform;
 }
 @keyframes preset-marquee {
@@ -826,7 +875,7 @@ body {
 }
 @media (max-width: 720px) {
   .preset-marquee { width: calc(100% + 48px); margin: 28px -24px 24px; }
-  .preset-marquee-track { animation-duration: 55s; }
+  .preset-marquee-track { animation-duration: 32s; }
   .preset-card { width: 160px; }
 }
 @property --glow-angle {
@@ -1120,6 +1169,14 @@ body {
     </div>
   </div>
 
+  <!-- ─── Scene 1 (hero) ─── -->
+  <div class="scene-showcase scene-hero reveal">
+    <div class="scene-figure">
+      <img src="images/Scene_1.jpg" alt="ParamOps scene render" loading="lazy">
+    </div>
+    <div class="scene-caption">This scene is <span class="accent">included</span></div>
+  </div>
+
   <!-- ─── Why ParamOps ─── -->
   <div class="prose-section reveal glow-border glow-slow">
     <span class="glow-border-ring"></span>
@@ -1129,6 +1186,14 @@ body {
       <p>But they have a real learning curve. Most artists who don't have time to master them end up missing out on one of the most useful techniques for 3D work: modular scattering. The ability to repeat and adapt geometry along curves, which can save hours of manual placement in any scene.</p>
       <p>Param<span style="color: var(--accent);">Ops</span> is built precisely for those artists. The ones who don't have time to study Geometry Nodes but still want to create complex, custom scatters for every kind of scene.</p>
     </div>
+  </div>
+
+  <!-- ─── Scene 2 (samples concept) ─── -->
+  <div class="scene-showcase reveal">
+    <div class="scene-figure square">
+      <img src="images/Scene_2.jpg" alt="ParamOps samples concept" loading="lazy">
+    </div>
+    <div class="scene-caption">This scene is <span class="accent">included</span></div>
   </div>
 
   <!-- ─── Samples & Advanced ─── -->
