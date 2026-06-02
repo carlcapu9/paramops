@@ -1,0 +1,1639 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ParamOps</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700;800;900&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #161719;
+  --bg-alt: #1d1f22;
+  --bg-deep: #0f1012;
+  --surface: #25282c;
+  --line: #2f3338;
+  --line-soft: #24272b;
+  --ink: #ededed;
+  --ink-soft: #b8bcc1;
+  --ink-mute: #7c8189;
+  --accent: #5a8fd6;
+  --accent-deep: #2f548f;
+  --accent-soft: rgba(90, 143, 214, 0.12);
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  font-family: 'Geist', sans-serif;
+  background: var(--bg);
+  color: var(--ink);
+  font-size: 16px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+.product {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 48px 36px 72px;
+}
+
+/* ─── Top wordmark ─── */
+.wordmark {
+  font-size: clamp(96px, 18vw, 240px);
+  font-weight: 700;
+  line-height: 0.9;
+  letter-spacing: -0.06em;
+  margin-bottom: 36px;
+  display: flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.wordmark .param { color: var(--ink); }
+.wordmark .ops { color: var(--accent); }
+.wordmark .dot {
+  display: inline-block;
+  width: clamp(14px, 2vw, 28px);
+  height: clamp(14px, 2vw, 28px);
+  background: var(--accent);
+  border-radius: 50%;
+  margin-left: clamp(8px, 1vw, 16px);
+  align-self: center;
+  position: relative;
+  top: clamp(-30px, -4vw, -50px);
+}
+
+/* ─── Intro ─── */
+.intro {
+  max-width: 880px;
+  margin: 0 auto 72px;
+  background: linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 44px 44px 40px;
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+}
+.intro::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, var(--accent) 30%, var(--accent) 70%, transparent 100%);
+  opacity: 0.6;
+}
+.intro::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+}
+.intro > * { position: relative; z-index: 1; }
+.intro-eyebrow {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+}
+.intro-eyebrow::before {
+  content: "";
+  width: 24px;
+  height: 1px;
+  background: var(--accent);
+}
+.intro-eyebrow::after {
+  content: "";
+  width: 24px;
+  height: 1px;
+  background: var(--accent);
+}
+.intro-headline {
+  font-size: clamp(24px, 2.8vw, 32px);
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  font-weight: 600;
+  margin-bottom: 16px;
+  color: var(--ink);
+}
+.intro-headline .accent { color: var(--accent); }
+.intro-headline .light { color: var(--ink-soft); font-weight: 600; }
+.intro-body {
+  font-size: clamp(24px, 2.8vw, 32px);
+  line-height: 1.3;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+  font-weight: 600;
+  max-width: 720px;
+  margin: 0 auto;
+}
+.intro-body p { margin-bottom: 14px; }
+.intro-body p:last-child { margin-bottom: 0; }
+.intro-body strong { color: var(--ink); font-weight: 500; }
+.intro-body .highlight { color: var(--accent); font-weight: 500; }
+
+/* ─── Prose section ─── */
+.prose-section {
+  max-width: 880px;
+  margin: 0 auto 72px;
+  background: linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 44px 44px 40px;
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+}
+.prose-section::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, var(--accent) 30%, var(--accent) 70%, transparent 100%);
+  opacity: 0.6;
+}
+.prose-section::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+}
+.prose-section > * { position: relative; z-index: 1; }
+.prose-section .section-tag {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 24px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+}
+.prose-section .section-tag::before,
+.prose-section .section-tag::after {
+  content: "";
+  width: 24px;
+  height: 1px;
+  background: var(--accent);
+}
+.prose-section .prose-body {
+  font-size: clamp(16px, 1.4vw, 18px);
+  line-height: 1.55;
+  letter-spacing: -0.005em;
+  color: var(--ink);
+  font-weight: 500;
+  max-width: 640px;
+  margin: 0 auto;
+}
+.prose-section .prose-body p { margin-bottom: 18px; }
+.prose-section .prose-body p:last-child { margin-bottom: 0; }
+.prose-section .prose-body .accent { color: var(--accent); }
+
+/* ─── Samples section ─── */
+.samples-frame {
+  max-width: 1080px;
+  margin: 0 auto 72px;
+  background: linear-gradient(180deg, var(--bg-alt) 0%, var(--bg) 100%);
+  border: 1px solid var(--line);
+  border-radius: 16px;
+  padding: 56px 48px 48px;
+  position: relative;
+  overflow: hidden;
+}
+.samples-frame::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent 0%, var(--accent) 30%, var(--accent) 70%, transparent 100%);
+  opacity: 0.6;
+}
+.samples-frame::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+  -webkit-mask-image: radial-gradient(ellipse at top, black 0%, transparent 70%);
+}
+.samples-frame > * { position: relative; z-index: 1; }
+.samples-header { text-align: center; margin-bottom: 48px; }
+.samples-header .section-tag {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 20px;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  justify-content: center;
+}
+.samples-header .section-tag::before,
+.samples-header .section-tag::after {
+  content: "";
+  width: 24px;
+  height: 1px;
+  background: var(--accent);
+}
+.samples-header .samples-headline {
+  font-size: clamp(20px, 2vw, 24px);
+  line-height: 1.35;
+  letter-spacing: -0.015em;
+  color: var(--ink);
+  font-weight: 600;
+  max-width: 640px;
+  margin: 0 auto;
+}
+.sample-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 40px;
+  align-items: center;
+  padding: 32px 0;
+  border-top: 1px solid var(--line);
+}
+.sample-row:first-of-type { border-top: 1px solid var(--line); }
+.sample-row.reverse .sample-text { order: 2; }
+.sample-row.reverse .sample-media { order: 1; }
+.sample-text { padding: 0 8px; }
+.sample-label {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--ink-mute);
+  margin-bottom: 10px;
+}
+.sample-name {
+  font-size: clamp(22px, 2.4vw, 28px);
+  letter-spacing: -0.02em;
+  font-weight: 700;
+  color: var(--ink);
+  margin-bottom: 14px;
+}
+.sample-name .accent { color: var(--accent); }
+.sample-desc {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  font-weight: 600;
+}
+.sample-desc strong { color: var(--ink); font-weight: 600; }
+.sample-media {
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  aspect-ratio: 4 / 3;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+  overflow: hidden;
+}
+.sample-media::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 20px 20px;
+}
+.sample-media-label {
+  position: absolute;
+  bottom: 14px;
+  left: 16px;
+  font-family: 'Geist Mono', monospace;
+  font-size: 10px;
+  color: var(--ink-mute);
+  z-index: 2;
+}
+.sample-media-label::before {
+  content: "□ ";
+  color: var(--accent);
+}
+.samples-divider {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin: 32px 0 16px;
+  padding: 0 8px;
+}
+.samples-divider::before,
+.samples-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+.samples-divider span {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+  white-space: nowrap;
+}
+@media (max-width: 720px) {
+  .samples-frame { padding: 36px 24px 32px; }
+  .sample-row { grid-template-columns: 1fr; gap: 20px; }
+  .sample-row.reverse .sample-text { order: 1; }
+  .sample-row.reverse .sample-media { order: 2; }
+}
+/* ─── INTERACTIVE: Scroll-revealed animations ─── */
+.reveal {
+  opacity: 0;
+  transform: translateY(30px);
+  transition: opacity 0.9s cubic-bezier(0.16, 1, 0.3, 1), transform 0.9s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal.in-view { opacity: 1; transform: translateY(0); }
+
+.reveal-stagger > * {
+  opacity: 0;
+  transform: translateY(20px);
+  transition: opacity 0.7s cubic-bezier(0.16, 1, 0.3, 1), transform 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.reveal-stagger.in-view > *:nth-child(1) { transition-delay: 0.05s; }
+.reveal-stagger.in-view > *:nth-child(2) { transition-delay: 0.15s; }
+.reveal-stagger.in-view > *:nth-child(3) { transition-delay: 0.25s; }
+.reveal-stagger.in-view > *:nth-child(4) { transition-delay: 0.35s; }
+.reveal-stagger.in-view > * { opacity: 1; transform: translateY(0); }
+
+/* ─── INTERACTIVE: Sticky shrinking wordmark ─── */
+.wordmark-sticky-wrapper {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: rgba(22, 23, 25, 0);
+  backdrop-filter: blur(0px);
+  -webkit-backdrop-filter: blur(0px);
+  transition: background 0.4s ease, backdrop-filter 0.4s ease, padding 0.4s ease;
+  padding: 0;
+  margin: 0 -36px;
+  padding: 0 36px;
+}
+.wordmark-sticky-wrapper.shrunk {
+  background: rgba(22, 23, 25, 0.85);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line);
+}
+.wordmark {
+  transition: font-size 0.5s cubic-bezier(0.16, 1, 0.3, 1), margin-bottom 0.5s cubic-bezier(0.16, 1, 0.3, 1), padding 0.5s ease;
+}
+.wordmark-sticky-wrapper.shrunk .wordmark {
+  font-size: clamp(28px, 4vw, 36px);
+  margin-bottom: 0;
+  padding: 14px 0;
+}
+.wordmark-sticky-wrapper.shrunk .wordmark .dot {
+  top: clamp(-8px, -1vw, -14px);
+  width: clamp(6px, 0.8vw, 10px);
+  height: clamp(6px, 0.8vw, 10px);
+}
+
+/* ─── INTERACTIVE: Hover glow on sample media ─── */
+.sample-media {
+  transition: border-color 0.4s ease, box-shadow 0.4s ease, transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  cursor: pointer;
+}
+.sample-media::after {
+  content: "";
+  position: absolute;
+  inset: -1px;
+  border-radius: 10px;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%), rgba(90, 143, 214, 0.25) 0%, transparent 60%);
+  pointer-events: none;
+  z-index: 1;
+}
+.sample-media:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 40px -8px rgba(90, 143, 214, 0.4), 0 0 0 1px rgba(90, 143, 214, 0.3);
+}
+.sample-media:hover::after { opacity: 1; }
+
+/* ─── INTERACTIVE: 3D tilt support ─── */
+.tilt {
+  transform-style: preserve-3d;
+  transition: transform 0.2s ease-out;
+  will-change: transform;
+}
+
+/* ─── INTERACTIVE: Animated background gradient ─── */
+.bg-gradient-blob {
+  display: none;
+  position: fixed;
+  pointer-events: none;
+  z-index: -1;
+  filter: blur(80px);
+  opacity: 0.35;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(90, 143, 214, 0.4) 0%, transparent 70%);
+  width: 600px;
+  height: 600px;
+  top: 20%;
+  left: -200px;
+  animation: blob-float-1 22s ease-in-out infinite;
+}
+.bg-gradient-blob:nth-child(2) {
+  top: 60%;
+  left: auto;
+  right: -200px;
+  background: radial-gradient(circle, rgba(47, 84, 143, 0.5) 0%, transparent 70%);
+  animation: blob-float-2 28s ease-in-out infinite;
+  animation-delay: -8s;
+}
+.bg-gradient-blob:nth-child(3) {
+  top: 100%;
+  left: 30%;
+  width: 800px;
+  height: 800px;
+  background: radial-gradient(circle, rgba(90, 143, 214, 0.25) 0%, transparent 70%);
+  animation: blob-float-3 35s ease-in-out infinite;
+  animation-delay: -14s;
+}
+@keyframes blob-float-1 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  33% { transform: translate(120px, -80px) scale(1.15); }
+  66% { transform: translate(-60px, 100px) scale(0.9); }
+}
+@keyframes blob-float-2 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-150px, -120px) scale(1.2); }
+}
+@keyframes blob-float-3 {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(100px, -200px) scale(1.1); }
+}
+
+/* ─── INTERACTIVE: Vertical scroll curve ─── */
+.scroll-curve {
+  position: fixed;
+  left: 12px;
+  top: 0;
+  height: 100vh;
+  width: 40px;
+  pointer-events: none;
+  z-index: 30;
+  opacity: 0.7;
+}
+.scroll-curve svg { width: 100%; height: 100%; overflow: visible; }
+.scroll-curve .curve-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 6px rgba(90, 143, 214, 0.4));
+  stroke-dasharray: 1000;
+  stroke-dashoffset: 1000;
+}
+.scroll-curve .curve-dot {
+  fill: var(--accent);
+  filter: drop-shadow(0 0 8px rgba(90, 143, 214, 0.8));
+}
+@media (max-width: 720px) {
+  .scroll-curve { display: none; }
+}
+
+/* ─── INTERACTIVE: Hero visual loop ─── */
+.curve-anim .curve-path,
+.curve-anim .sample {
+  animation-iteration-count: 1;
+}
+.hero-visual.replay .curve-anim .curve-path {
+  animation: draw 2.4s ease-out forwards;
+}
+.hero-visual.replay .curve-anim .sample {
+  animation: pop 0.45s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
+}
+
+/* ─── INTERACTIVE: Number counters ─── */
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 1px;
+  background: var(--line);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  overflow: hidden;
+  max-width: 880px;
+  margin: 0 auto 72px;
+}
+.stat-item {
+  padding: 36px 24px;
+  background: var(--bg-alt);
+  text-align: center;
+}
+.stat-num {
+  font-size: clamp(40px, 5vw, 56px);
+  font-weight: 700;
+  letter-spacing: -0.04em;
+  color: var(--accent);
+  line-height: 1;
+  margin-bottom: 8px;
+  display: inline-flex;
+  align-items: baseline;
+}
+.stat-num .plus { font-size: 0.6em; }
+.stat-label {
+  font-family: 'Geist Mono', monospace;
+  font-size: 11px;
+  color: var(--ink-mute);
+  letter-spacing: 0.04em;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal, .reveal-stagger > * { opacity: 1; transform: none; transition: none; }
+  .bg-gradient-blob { animation: none; }
+}
+
+/* ─── ADVANCED: WebGL/Canvas noise background ─── */
+.webgl-bg {
+  position: fixed;
+  inset: 0;
+  z-index: -2;
+  pointer-events: none;
+  opacity: 0.55;
+}
+
+/* ─── Sample media videos + multi-video switcher ─── */
+.sample-media video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  z-index: 1;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+}
+.sample-media video.active { opacity: 1; }
+.sample-video-nav {
+  position: absolute;
+  bottom: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  background: rgba(15, 16, 18, 0.9);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  border: 1px solid rgba(90, 143, 214, 0.4);
+  border-radius: 999px;
+  padding: 7px 12px;
+  opacity: 1;
+  box-shadow: 0 4px 20px -6px rgba(0,0,0,0.5);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+.sample-media:hover .sample-video-nav {
+  border-color: rgba(90, 143, 214, 0.7);
+  box-shadow: 0 4px 24px -4px rgba(90, 143, 214, 0.4);
+}
+.sample-video-arrow {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: rgba(90, 143, 214, 0.15);
+  color: var(--accent);
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 17px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0;
+  transition: color 0.2s ease, background 0.2s ease, transform 0.2s ease;
+}
+.sample-video-arrow:hover {
+  color: var(--bg-deep);
+  background: var(--accent);
+  border-color: var(--accent);
+  transform: scale(1.1);
+}
+.sample-video-arrow:active { transform: scale(0.95); }
+.sample-video-dots {
+  display: flex;
+  gap: 6px;
+}
+.sample-video-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--ink-mute);
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+.sample-video-dot.active { background: var(--accent); transform: scale(1.4); }
+.sample-video-caption {
+  position: absolute;
+  top: 12px;
+  left: 14px;
+  z-index: 6;
+  font-family: 'Geist Mono', monospace;
+  font-size: 10px;
+  color: var(--ink-soft);
+  background: rgba(15, 16, 18, 0.7);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--line);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+}
+.sample-media:hover .sample-video-caption { opacity: 1; }
+
+/* ─── Video tutorial section ─── */
+.video-frame {
+  max-width: 1080px;
+  margin: 0 auto 72px;
+  position: relative;
+  border-radius: 16px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  background: var(--bg-deep);
+  box-shadow: 0 30px 80px -30px rgba(0,0,0,0.6);
+}
+.video-frame-inner {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 16 / 9;
+}
+.video-frame-inner iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
+}
+
+/* ─── Price display ─── */
+.price-block {
+  max-width: 880px;
+  margin: 0 auto 72px;
+  text-align: center;
+  padding: 8px 0;
+}
+.price-row {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 18px;
+}
+.price-old {
+  font-size: clamp(28px, 3vw, 38px);
+  font-weight: 500;
+  color: var(--ink-mute);
+  position: relative;
+  letter-spacing: -0.02em;
+}
+.price-old::after {
+  content: "";
+  position: absolute;
+  left: -4px;
+  right: -4px;
+  top: 52%;
+  height: 3px;
+  background: #e5484d;
+  transform: rotate(-8deg);
+  border-radius: 2px;
+}
+.price-now {
+  font-size: clamp(48px, 6vw, 76px);
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: -0.04em;
+  line-height: 1;
+}
+.price-now .cur {
+  font-size: 0.55em;
+  vertical-align: super;
+  font-weight: 500;
+}
+.price-caption {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--ink-mute);
+  margin-top: 16px;
+  letter-spacing: 0.04em;
+}
+.price-caption .accent { color: var(--accent); }
+
+/* ─── ADVANCED: Preset marquee (square renders, auto-scroll, pause on hover) ─── */
+.preset-marquee {
+  position: relative;
+  width: calc(100% + 88px);
+  margin: 32px -44px 28px;
+  overflow: hidden;
+  padding: 4px 0;
+  mask-image: linear-gradient(90deg, transparent 0%, black 6%, black 94%, transparent 100%);
+  -webkit-mask-image: linear-gradient(90deg, transparent 0%, black 6%, black 94%, transparent 100%);
+}
+.preset-marquee-track {
+  display: flex;
+  gap: 16px;
+  width: max-content;
+  animation: preset-marquee 90s linear infinite;
+  will-change: transform;
+}
+@keyframes preset-marquee {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.preset-card {
+  flex: 0 0 auto;
+  width: clamp(180px, 18vw, 260px);
+  aspect-ratio: 1 / 1;
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  position: relative;
+  transition: transform 0.35s cubic-bezier(0.16, 1, 0.3, 1), border-color 0.35s ease, box-shadow 0.35s ease;
+  cursor: pointer;
+}
+.preset-card::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.018) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.018) 1px, transparent 1px);
+  background-size: 20px 20px;
+  z-index: 1;
+  pointer-events: none;
+}
+.preset-card img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  position: relative;
+  z-index: 2;
+}
+.preset-card-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'Geist Mono', monospace;
+  font-size: 11px;
+  color: var(--ink-mute);
+  z-index: 2;
+  letter-spacing: 0.04em;
+}
+.preset-card-placeholder::before {
+  content: "□ ";
+  color: var(--accent);
+  margin-right: 6px;
+}
+.preset-card:hover {
+  transform: translateY(-6px) scale(1.03);
+  border-color: var(--accent);
+  box-shadow: 0 24px 60px -20px rgba(90, 143, 214, 0.4), 0 0 0 1px rgba(90, 143, 214, 0.3);
+  z-index: 5;
+}
+@media (max-width: 720px) {
+  .preset-marquee { width: calc(100% + 48px); margin: 28px -24px 24px; }
+  .preset-marquee-track { animation-duration: 55s; }
+  .preset-card { width: 160px; }
+}
+@property --glow-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes glow-rotate {
+  to { --glow-angle: 360deg; }
+}
+.glow-border {
+  position: relative;
+}
+.glow-border-ring {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  border-radius: inherit;
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--glow-angle),
+    rgba(90, 143, 214, 0) 0%,
+    rgba(90, 143, 214, 0) 35%,
+    rgba(90, 143, 214, 1) 50%,
+    rgba(120, 180, 240, 0.6) 52%,
+    rgba(90, 143, 214, 0) 65%,
+    rgba(90, 143, 214, 0) 100%
+  );
+  -webkit-mask:
+    linear-gradient(#fff 0 0) content-box,
+    linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+          mask-composite: exclude;
+  animation: glow-rotate 8s linear infinite;
+  pointer-events: none;
+  filter: drop-shadow(0 0 6px rgba(90, 143, 214, 0.5));
+}
+.glow-slow .glow-border-ring { animation-duration: 14s; }
+.glow-fast .glow-border-ring { animation-duration: 5s; }
+/* Ensure inner content stays above the ring */
+.glow-border > *:not(.glow-border-ring) {
+  position: relative;
+  z-index: 1;
+}
+.letter-zoom {
+  display: inline-block;
+}
+.letter-zoom .lz-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+.letter-zoom .lz-char {
+  display: inline-block;
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1), color 0.25s ease;
+  transform-origin: center bottom;
+  will-change: transform;
+}
+.letter-zoom .lz-char.zoomed {
+  transform: scale(1.35) translateY(-2px);
+  color: var(--accent);
+}
+
+/* ─── ADVANCED: Magnetic hover ─── */
+.magnetic { will-change: transform; transition: transform 0.4s cubic-bezier(0.16, 1, 0.3, 1); }
+
+/* ─── ADVANCED: Character text reveal ─── */
+.char-reveal {
+  display: inline-block;
+}
+.char-reveal .char-group,
+.char-reveal .char-word {
+  display: inline-block;
+  white-space: nowrap;
+}
+.char-reveal .char {
+  display: inline-block;
+  opacity: 0;
+  transform: translateY(0.6em);
+  transition: opacity 0.5s cubic-bezier(0.16, 1, 0.3, 1), transform 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.char-reveal.in-view .char {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+/* ─── ADVANCED: Parallax layers ─── */
+.parallax { will-change: transform; }
+
+/* ─── ADVANCED: Central scroll curve diagram ─── */
+.scroll-diagram {
+  position: relative;
+  max-width: 1080px;
+  margin: 80px auto;
+  padding: 0 36px;
+  min-height: 400px;
+}
+.scroll-diagram-svg {
+  width: 100%;
+  height: auto;
+  overflow: visible;
+}
+.scroll-diagram .diag-curve {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-dasharray: 2000;
+  stroke-dashoffset: 2000;
+  filter: drop-shadow(0 0 10px rgba(90, 143, 214, 0.4));
+}
+.scroll-diagram .diag-sample {
+  opacity: 0;
+  transform-origin: center;
+  transition: opacity 0.6s ease-out, transform 0.6s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.scroll-diagram .diag-sample.show {
+  opacity: 1;
+}
+.scroll-diagram .diag-label {
+  font-family: 'Geist Mono', monospace;
+  font-size: 11px;
+  fill: var(--ink-mute);
+  letter-spacing: 0.04em;
+  opacity: 0;
+  transition: opacity 0.5s ease 0.2s;
+}
+.scroll-diagram .diag-sample.show + .diag-label,
+.scroll-diagram .diag-sample.show .diag-label { opacity: 1; }
+.scroll-diagram-cap {
+  text-align: center;
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  letter-spacing: 0.05em;
+  margin-bottom: 24px;
+}
+.scroll-diagram-cap::before,
+.scroll-diagram-cap::after {
+  content: "—";
+  margin: 0 12px;
+  color: var(--accent);
+}
+
+/* ─── ADVANCED: Apple-style pin & reveal ─── */
+.pin-scroll-section {
+  position: relative;
+  /* Tall section so user scrolls through it */
+}
+.pin-sticky {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.pin-content {
+  width: 100%;
+  max-width: 1080px;
+  padding: 36px;
+  text-align: center;
+}
+.pin-title {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--accent);
+  margin-bottom: 24px;
+  letter-spacing: 0.05em;
+}
+.pin-stage {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 48px;
+  align-items: center;
+  min-height: 360px;
+}
+.pin-text {
+  text-align: left;
+}
+.pin-text-label {
+  font-family: 'Geist Mono', monospace;
+  font-size: 12px;
+  color: var(--ink-mute);
+  margin-bottom: 8px;
+}
+.pin-text-name {
+  font-size: clamp(32px, 4vw, 52px);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  color: var(--accent);
+  margin-bottom: 16px;
+  line-height: 1;
+}
+.pin-text-desc {
+  font-size: 16px;
+  line-height: 1.6;
+  color: var(--ink-soft);
+  max-width: 460px;
+}
+.pin-visual {
+  background: var(--bg-deep);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  aspect-ratio: 4/3;
+  position: relative;
+  overflow: hidden;
+}
+.pin-visual::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255,255,255,0.02) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.02) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+.pin-visual-label {
+  position: absolute;
+  bottom: 14px;
+  left: 16px;
+  font-family: 'Geist Mono', monospace;
+  font-size: 10px;
+  color: var(--ink-mute);
+}
+.pin-visual-label::before { content: "□ "; color: var(--accent); }
+.pin-progress {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 36px;
+}
+.pin-progress-dot {
+  width: 24px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  transition: background 0.3s ease, width 0.3s ease;
+}
+.pin-progress-dot.active {
+  background: var(--accent);
+  width: 36px;
+}
+.pin-slide {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  transition: opacity 0.4s ease;
+  pointer-events: none;
+}
+.pin-slide.active { opacity: 1; pointer-events: auto; }
+@media (max-width: 720px) {
+  .pin-stage { grid-template-columns: 1fr; gap: 24px; }
+  .pin-sticky { height: auto; padding: 60px 0; }
+  .pin-scroll-section { height: auto !important; }
+}
+</style>
+</head>
+<body>
+
+<!-- WebGL/Canvas noise background -->
+<canvas class="webgl-bg" id="webglBg"></canvas>
+
+<!-- Animated background blobs -->
+<div class="bg-gradient-blob"></div>
+<div class="bg-gradient-blob"></div>
+<div class="bg-gradient-blob"></div>
+
+<!-- Vertical scroll curve -->
+<div class="scroll-curve">
+  <svg viewBox="0 0 40 800" preserveAspectRatio="none">
+    <path id="scrollCurvePath" class="curve-line"
+          d="M 20 0 Q 30 100, 20 200 T 20 400 T 20 600 T 20 800"
+          pathLength="1000"></path>
+    <circle id="scrollCurveDot" class="curve-dot" cx="20" cy="0" r="4"></circle>
+  </svg>
+</div>
+
+<div class="product">
+
+  <!-- ─── Top wordmark (sticky shrinking) ─── -->
+  <div class="wordmark-sticky-wrapper" id="wordmarkSticky">
+    <div class="wordmark parallax"><span class="param">Param</span><span class="ops">Ops</span><span class="dot"></span></div>
+  </div>
+
+  <!-- ─── Intro ─── -->
+  <div class="intro reveal glow-border">
+    <span class="glow-border-ring"></span>
+    <div class="intro-body">
+      <p class="char-reveal">Param<span style="color: var(--accent);">Ops</span> brings parametric scattering along curves to Blender. No Geometry Nodes required.</p>
+    </div>
+  </div>
+
+  <!-- ─── Why ParamOps ─── -->
+  <div class="prose-section reveal glow-border glow-slow">
+    <span class="glow-border-ring"></span>
+    <div class="prose-body">
+      <p>Geometry Nodes are powerful. Not everyone has time to learn them.</p>
+      <p>Blender's Geometry Nodes are an incredibly powerful tool. They let you build almost any procedural system you can imagine.</p>
+      <p>But they have a real learning curve. Most artists who don't have time to master them end up missing out on one of the most useful techniques for 3D work: modular scattering. The ability to repeat and adapt geometry along curves, which can save hours of manual placement in any scene.</p>
+      <p>Param<span style="color: var(--accent);">Ops</span> is built precisely for those artists. The ones who don't have time to study Geometry Nodes but still want to create complex, custom scatters for every kind of scene.</p>
+    </div>
+  </div>
+
+  <!-- ─── Samples & Advanced ─── -->
+  <div class="samples-frame reveal glow-border">
+    <span class="glow-border-ring"></span>
+    <div class="samples-header">
+      <p class="samples-headline">Param<span style="color: var(--accent);">Ops</span> is simple. You assign your meshes to five sample slots, draw a curve, and the scatter builds itself.</p>
+    </div>
+
+    <div class="sample-row reveal">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Default</span></h3>
+        <p class="sample-desc letter-zoom">The main module that repeats along the curve. It stretches and adapts to fit any length.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="default"><video class="sample-vid active" src="images/Default.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>default</div></div>
+    </div>
+
+    <div class="sample-row reveal reverse">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Start &amp; End</span></h3>
+        <p class="sample-desc letter-zoom">Samples placed at the beginning and at the end of the scatter to close it cleanly.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="start & end"><video class="sample-vid active" src="images/Start_End.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>start & end</div></div>
+    </div>
+
+    <div class="sample-row reveal">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Evenly</span></h3>
+        <p class="sample-desc letter-zoom">A module placed at regular intervals along the curve.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="evenly|spacing"><video class="sample-vid active" src="images/Evenly.mp4" muted loop playsinline preload="metadata" data-index="0"></video><video class="sample-vid" src="images/Evenly_Spacing.mp4" muted loop playsinline preload="metadata" data-index="1"></video><div class="sample-video-caption" data-captions>evenly</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
+    </div>
+
+    <div class="sample-row reveal reverse">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Corner</span></h3>
+        <p class="sample-desc letter-zoom">A sample placed at the corners of the curve.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="corner|slide"><video class="sample-vid active" src="images/Corner.mp4" muted loop playsinline preload="metadata" data-index="0"></video><video class="sample-vid" src="images/Corner_Slide.mp4" muted loop playsinline preload="metadata" data-index="1"></video><div class="sample-video-caption" data-captions>corner</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
+    </div>
+
+    <div class="sample-row reveal">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Segment IDs</span></h3>
+        <p class="sample-desc letter-zoom">Change the Default sample in parts of the curve. Mix different geometries in one scatter.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="segment id"><video class="sample-vid active" src="images/Segment_ID.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>segment id</div></div>
+    </div>
+
+    <div class="sample-row reveal reverse">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Markers</span></h3>
+        <p class="sample-desc letter-zoom">Pin a sample to a specific point of the curve.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="markers"><video class="sample-vid active" src="images/Markers.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>markers</div></div>
+    </div>
+
+    <div class="sample-row reveal">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Round Corners</span></h3>
+        <p class="sample-desc letter-zoom">A non-destructive, procedural way to round the corners of your scatter with a custom radius.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="radius"><video class="sample-vid active" src="images/Corner_Radius.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>radius</div></div>
+    </div>
+
+    <div class="sample-row reveal reverse">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Vertical &amp; Slopes</span></h3>
+        <p class="sample-desc letter-zoom">Detects climbs and slopes along the curve and orients the scatter upward, following the rise of the path.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="vertical|on / off"><video class="sample-vid active" src="images/Vertical.mp4" muted loop playsinline preload="metadata" data-index="0"></video><video class="sample-vid" src="images/Vertical_On_Off.mp4" muted loop playsinline preload="metadata" data-index="1"></video><div class="sample-video-caption" data-captions>vertical</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
+    </div>
+
+    <div class="sample-row reveal">
+      <div class="sample-text">
+        <h3 class="sample-name"><span class="accent">Flat Top / Bottom / Center</span></h3>
+        <p class="sample-desc letter-zoom">Keeps the top or bottom of the sample flat when the curve goes up or down a slope.</p>
+      </div>
+      <div class="sample-media magnetic" data-captions="flat top / bottom"><video class="sample-vid active" src="images/Flat_Top_Bottom.mp4" muted loop playsinline preload="metadata" data-index="0"></video><div class="sample-video-caption" data-captions>flat top / bottom</div></div>
+    </div>
+  </div>
+
+  <!-- ─── Video tutorial ─── -->
+  <div class="video-frame reveal glow-border">
+    <span class="glow-border-ring"></span>
+    <div class="video-frame-inner">
+      <iframe src="https://www.youtube.com/embed/Z2YV7C6OUE8?rel=0"
+              title="ParamOps Tutorial"
+              allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+              referrerpolicy="strict-origin-when-cross-origin"
+              allowfullscreen></iframe>
+    </div>
+  </div>
+
+  <!-- ─── Included presets ─── -->
+  <div class="prose-section reveal glow-border">
+    <span class="glow-border-ring"></span>
+    <div class="prose-body">
+      <p>Param<span style="color: var(--accent);">Ops</span> comes with a file containing <span style="color: var(--accent);">28 ready-made scatters</span>.</p>
+    </div>
+
+    <!-- Marquee carousel of preset renders -->
+    <div class="preset-marquee">
+      <div class="preset-marquee-track">
+        <!-- Set 1: original 22 renders -->
+        <div class="preset-card"><img src="images/1.png" alt="ParamOps preset 1" loading="lazy"></div>
+        <div class="preset-card"><img src="images/2.png" alt="ParamOps preset 2" loading="lazy"></div>
+        <div class="preset-card"><img src="images/3.png" alt="ParamOps preset 3" loading="lazy"></div>
+        <div class="preset-card"><img src="images/4.png" alt="ParamOps preset 4" loading="lazy"></div>
+        <div class="preset-card"><img src="images/5.png" alt="ParamOps preset 5" loading="lazy"></div>
+        <div class="preset-card"><img src="images/6.png" alt="ParamOps preset 6" loading="lazy"></div>
+        <div class="preset-card"><img src="images/7.png" alt="ParamOps preset 7" loading="lazy"></div>
+        <div class="preset-card"><img src="images/8.png" alt="ParamOps preset 8" loading="lazy"></div>
+        <div class="preset-card"><img src="images/9.png" alt="ParamOps preset 9" loading="lazy"></div>
+        <div class="preset-card"><img src="images/10.png" alt="ParamOps preset 10" loading="lazy"></div>
+        <div class="preset-card"><img src="images/11.png" alt="ParamOps preset 11" loading="lazy"></div>
+        <div class="preset-card"><img src="images/12.png" alt="ParamOps preset 12" loading="lazy"></div>
+        <div class="preset-card"><img src="images/13.png" alt="ParamOps preset 13" loading="lazy"></div>
+        <div class="preset-card"><img src="images/14.png" alt="ParamOps preset 14" loading="lazy"></div>
+        <div class="preset-card"><img src="images/15.png" alt="ParamOps preset 15" loading="lazy"></div>
+        <div class="preset-card"><img src="images/16.png" alt="ParamOps preset 16" loading="lazy"></div>
+        <div class="preset-card"><img src="images/17.png" alt="ParamOps preset 17" loading="lazy"></div>
+        <div class="preset-card"><img src="images/18.png" alt="ParamOps preset 18" loading="lazy"></div>
+        <div class="preset-card"><img src="images/19.png" alt="ParamOps preset 19" loading="lazy"></div>
+        <div class="preset-card"><img src="images/20.png" alt="ParamOps preset 20" loading="lazy"></div>
+        <div class="preset-card"><img src="images/21.png" alt="ParamOps preset 21" loading="lazy"></div>
+        <div class="preset-card"><img src="images/22.png" alt="ParamOps preset 22" loading="lazy"></div>
+        <!-- Set 2: duplicate for seamless infinite scroll -->
+        <div class="preset-card"><img src="images/1.png" alt="ParamOps preset 1" loading="lazy"></div>
+        <div class="preset-card"><img src="images/2.png" alt="ParamOps preset 2" loading="lazy"></div>
+        <div class="preset-card"><img src="images/3.png" alt="ParamOps preset 3" loading="lazy"></div>
+        <div class="preset-card"><img src="images/4.png" alt="ParamOps preset 4" loading="lazy"></div>
+        <div class="preset-card"><img src="images/5.png" alt="ParamOps preset 5" loading="lazy"></div>
+        <div class="preset-card"><img src="images/6.png" alt="ParamOps preset 6" loading="lazy"></div>
+        <div class="preset-card"><img src="images/7.png" alt="ParamOps preset 7" loading="lazy"></div>
+        <div class="preset-card"><img src="images/8.png" alt="ParamOps preset 8" loading="lazy"></div>
+        <div class="preset-card"><img src="images/9.png" alt="ParamOps preset 9" loading="lazy"></div>
+        <div class="preset-card"><img src="images/10.png" alt="ParamOps preset 10" loading="lazy"></div>
+        <div class="preset-card"><img src="images/11.png" alt="ParamOps preset 11" loading="lazy"></div>
+        <div class="preset-card"><img src="images/12.png" alt="ParamOps preset 12" loading="lazy"></div>
+        <div class="preset-card"><img src="images/13.png" alt="ParamOps preset 13" loading="lazy"></div>
+        <div class="preset-card"><img src="images/14.png" alt="ParamOps preset 14" loading="lazy"></div>
+        <div class="preset-card"><img src="images/15.png" alt="ParamOps preset 15" loading="lazy"></div>
+        <div class="preset-card"><img src="images/16.png" alt="ParamOps preset 16" loading="lazy"></div>
+        <div class="preset-card"><img src="images/17.png" alt="ParamOps preset 17" loading="lazy"></div>
+        <div class="preset-card"><img src="images/18.png" alt="ParamOps preset 18" loading="lazy"></div>
+        <div class="preset-card"><img src="images/19.png" alt="ParamOps preset 19" loading="lazy"></div>
+        <div class="preset-card"><img src="images/20.png" alt="ParamOps preset 20" loading="lazy"></div>
+        <div class="preset-card"><img src="images/21.png" alt="ParamOps preset 21" loading="lazy"></div>
+        <div class="preset-card"><img src="images/22.png" alt="ParamOps preset 22" loading="lazy"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ─── Early Access + offer (merged) ─── -->
+  <div class="prose-section reveal glow-border glow-slow">
+    <span class="glow-border-ring"></span>
+    <div class="prose-body">
+      <p>This is an <span style="color: var(--accent);">early access</span> release of Param<span style="color: var(--accent);">Ops</span>. It has been heavily tested, but updates and improvements are still on the way. The current price is a special <span style="color: var(--accent);">early access offer</span>. By buying now, you also get all future updates for free, with no need to pay again.</p>
+    </div>
+  </div>
+
+  <!-- ─── Price ─── -->
+  <div class="price-block reveal">
+    <div class="price-row">
+      <span class="price-old">$64.99</span>
+      <span class="price-now"><span class="cur">$</span>24.99</span>
+    </div>
+    <div class="price-caption">Limited <span class="accent">early access</span> price</div>
+  </div>
+
+</div>
+
+<script>
+(function() {
+
+  // ─── 1. Scroll-revealed fade-in ───
+  const revealEls = document.querySelectorAll('.reveal');
+  const io = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('in-view');
+        io.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.12, rootMargin: '0px 0px -60px 0px' });
+  revealEls.forEach(el => io.observe(el));
+
+  // ─── 1b. Character reveal animation ───
+  document.querySelectorAll('.char-reveal').forEach(el => {
+    // Split text into chars but wrap each word so it doesn't break mid-word
+    const walkAndSplit = (node) => {
+      const nodes = Array.from(node.childNodes);
+      const out = [];
+      nodes.forEach(n => {
+        if (n.nodeType === 3) { // text node
+          // Split into words (keeping spaces as separators), then chars within each word
+          const parts = n.textContent.split(/(\s+)/);
+          parts.forEach(part => {
+            if (part.length === 0) return;
+            if (/^\s+$/.test(part)) {
+              // whitespace: just emit a space char
+              const sp = document.createElement('span');
+              sp.className = 'char';
+              sp.innerHTML = '&nbsp;';
+              out.push(sp);
+            } else {
+              // word: wrap chars in a nowrap container
+              const word = document.createElement('span');
+              word.className = 'char-word';
+              part.split('').forEach(ch => {
+                const c = document.createElement('span');
+                c.className = 'char';
+                c.textContent = ch;
+                word.appendChild(c);
+              });
+              out.push(word);
+            }
+          });
+        } else if (n.nodeType === 1) { // element node
+          const wrapped = document.createElement('span');
+          wrapped.className = 'char-group';
+          wrapped.style.color = n.style.color || '';
+          const inner = walkAndSplit(n);
+          inner.forEach(c => wrapped.appendChild(c));
+          out.push(wrapped);
+        }
+      });
+      return out;
+    };
+    const newChildren = walkAndSplit(el);
+    el.innerHTML = '';
+    newChildren.forEach(c => el.appendChild(c));
+    // Apply per-char delay
+    const allChars = el.querySelectorAll('.char');
+    allChars.forEach((c, i) => {
+      c.style.transitionDelay = (i * 0.018) + 's';
+    });
+  });
+  const charIO = new IntersectionObserver((entries) => {
+    entries.forEach(e => {
+      if (e.isIntersecting) {
+        e.target.classList.add('in-view');
+        charIO.unobserve(e.target);
+      }
+    });
+  }, { threshold: 0.3 });
+  document.querySelectorAll('.char-reveal').forEach(el => charIO.observe(el));
+
+  // ─── 2. Sticky shrinking wordmark ───
+  const sticky = document.getElementById('wordmarkSticky');
+  const onScroll = () => {
+    const y = window.scrollY;
+    if (y > 80) sticky.classList.add('shrunk');
+    else sticky.classList.remove('shrunk');
+  };
+  window.addEventListener('scroll', onScroll, { passive: true });
+  onScroll();
+
+  // ─── 3. Lateral scroll curve progress ───
+  const scrollPath = document.getElementById('scrollCurvePath');
+  const scrollDot = document.getElementById('scrollCurveDot');
+  function updateScrollCurve() {
+    if (!scrollPath) return;
+    const doc = document.documentElement;
+    const scrollable = doc.scrollHeight - window.innerHeight;
+    const progress = scrollable > 0 ? Math.min(1, Math.max(0, window.scrollY / scrollable)) : 0;
+    scrollPath.style.strokeDashoffset = 1000 * (1 - progress);
+    try {
+      const len = scrollPath.getTotalLength();
+      const pt = scrollPath.getPointAtLength(len * progress);
+      scrollDot.setAttribute('cx', pt.x);
+      scrollDot.setAttribute('cy', pt.y);
+    } catch (e) {}
+  }
+  window.addEventListener('scroll', updateScrollCurve, { passive: true });
+  window.addEventListener('resize', updateScrollCurve);
+  updateScrollCurve();
+
+  // ─── 4. Hover glow follow-mouse on sample media ───
+  document.querySelectorAll('.sample-media').forEach(el => {
+    el.addEventListener('mousemove', (e) => {
+      const rect = el.getBoundingClientRect();
+      const x = ((e.clientX - rect.left) / rect.width) * 100;
+      const y = ((e.clientY - rect.top) / rect.height) * 100;
+      el.style.setProperty('--mx', x + '%');
+      el.style.setProperty('--my', y + '%');
+    });
+  });
+
+  // ─── 5. 3D tilt + Magnetic on sample media ───
+  document.querySelectorAll('.sample-media').forEach(el => {
+    el.classList.add('tilt');
+    const maxTilt = 5;
+    const maxMagnet = 8;
+    el.addEventListener('mousemove', (e) => {
+      const rect = el.getBoundingClientRect();
+      const x = (e.clientX - rect.left) / rect.width;
+      const y = (e.clientY - rect.top) / rect.height;
+      const rx = (y - 0.5) * -maxTilt * 2;
+      const ry = (x - 0.5) * maxTilt * 2;
+      const mx = (x - 0.5) * maxMagnet;
+      const my = (y - 0.5) * maxMagnet;
+      el.style.transform = `perspective(900px) rotateX(${rx}deg) rotateY(${ry}deg) translate(${mx}px, ${my}px)`;
+    });
+    el.addEventListener('mouseleave', () => {
+      el.style.transform = 'perspective(900px) rotateX(0) rotateY(0) translate(0, 0)';
+    });
+  });
+
+  // ─── 6. Hero visual loop replay ───
+  const heroVisual = document.querySelector('.hero-visual');
+  if (heroVisual) {
+    setInterval(() => {
+      heroVisual.classList.remove('replay');
+      void heroVisual.offsetWidth;
+      heroVisual.classList.add('replay');
+    }, 9000);
+  }
+
+  // ─── 7. (removed: cursor trail) ───
+
+  // ─── 7b. Letter zoom on hover (proximity-based) ───
+  document.querySelectorAll('.letter-zoom').forEach(el => {
+    // Split text into words; each word is a nowrap container of chars (no mid-word break)
+    const text = el.textContent;
+    el.textContent = '';
+    const chars = [];
+    const parts = text.split(/(\s+)/);
+    parts.forEach(part => {
+      if (part.length === 0) return;
+      if (/^\s+$/.test(part)) {
+        // whitespace: a single breakable space
+        el.appendChild(document.createTextNode(' '));
+      } else {
+        const word = document.createElement('span');
+        word.className = 'lz-word';
+        part.split('').forEach(ch => {
+          const c = document.createElement('span');
+          c.className = 'lz-char';
+          c.textContent = ch;
+          word.appendChild(c);
+          chars.push(c);
+        });
+        el.appendChild(word);
+      }
+    });
+    const radius = 60;
+    el.addEventListener('mousemove', (e) => {
+      chars.forEach(c => {
+        const r = c.getBoundingClientRect();
+        const cx = r.left + r.width / 2;
+        const cy = r.top + r.height / 2;
+        const dx = e.clientX - cx;
+        const dy = e.clientY - cy;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < radius) {
+          const t = 1 - (dist / radius);
+          const scale = 1 + 0.4 * t;
+          const ty = -3 * t;
+          c.style.transform = `scale(${scale}) translateY(${ty}px)`;
+          c.style.color = t > 0.5 ? 'var(--accent)' : '';
+        } else {
+          c.style.transform = '';
+          c.style.color = '';
+        }
+      });
+    });
+    el.addEventListener('mouseleave', () => {
+      chars.forEach(c => {
+        c.style.transform = '';
+        c.style.color = '';
+      });
+    });
+  });
+
+  // ─── 8. Magnetic effect on .magnetic elements ───
+  document.querySelectorAll('.magnetic').forEach(el => {
+    // sample-media already handled with tilt+magnet above; this is for other elements
+    if (el.classList.contains('sample-media')) return;
+    const strength = 12;
+    el.addEventListener('mousemove', (e) => {
+      const rect = el.getBoundingClientRect();
+      const x = (e.clientX - rect.left - rect.width / 2) / rect.width;
+      const y = (e.clientY - rect.top - rect.height / 2) / rect.height;
+      el.style.transform = `translate(${x * strength}px, ${y * strength}px)`;
+    });
+    el.addEventListener('mouseleave', () => {
+      el.style.transform = 'translate(0, 0)';
+    });
+  });
+
+  // ─── 9. Parallax depth on .parallax elements ───
+  const parallaxEls = document.querySelectorAll('.parallax');
+  function applyParallax() {
+    const y = window.scrollY;
+    parallaxEls.forEach((el, i) => {
+      const speed = el.dataset.parallaxSpeed ? parseFloat(el.dataset.parallaxSpeed) : 0.15;
+      el.style.setProperty('--parallax-y', (-y * speed) + 'px');
+    });
+  }
+  // Parallax is subtle; only on wordmark for now
+  // window.addEventListener('scroll', applyParallax, { passive: true });
+
+  // ─── 10. WebGL noise background (canvas-based fluid noise) ───
+  const canvas = document.getElementById('webglBg');
+  if (canvas && canvas.getContext) {
+    const ctx = canvas.getContext('2d');
+    let W = 0, H = 0;
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+    }
+    resize();
+    window.addEventListener('resize', resize);
+
+    // Simplex-like blob field: a few moving radial gradients with low-poly noise overlay
+    const blobs = [];
+    const N = 5;
+    for (let i = 0; i < N; i++) {
+      blobs.push({
+        x: Math.random() * 1,
+        y: Math.random() * 1,
+        vx: (Math.random() - 0.5) * 0.0006,
+        vy: (Math.random() - 0.5) * 0.0006,
+        r: 0.25 + Math.random() * 0.25,
+        hue: 210 + Math.random() * 20, // blue range
+        alpha: 0.18 + Math.random() * 0.15
+      });
+    }
+    function tick() {
+      ctx.clearRect(0, 0, W, H);
+      // Draw subtle radial gradients
+      blobs.forEach(b => {
+        b.x += b.vx; b.y += b.vy;
+        if (b.x < -0.2 || b.x > 1.2) b.vx *= -1;
+        if (b.y < -0.2 || b.y > 1.2) b.vy *= -1;
+        const cx = b.x * W;
+        const cy = b.y * H;
+        const r = b.r * Math.min(W, H);
+        const grad = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+        grad.addColorStop(0, `hsla(${b.hue}, 70%, 55%, ${b.alpha})`);
+        grad.addColorStop(1, `hsla(${b.hue}, 70%, 55%, 0)`);
+        ctx.fillStyle = grad;
+        ctx.fillRect(0, 0, W, H);
+      });
+      requestAnimationFrame(tick);
+    }
+    tick();
+  }
+
+  // ─── 11. (removed: central scroll-driven diagram) ───
+
+  // ─── 12. (removed: showcase slider — replaced with preset marquee inside presets section) ───
+
+  // ─── 13. Sample video players: autoplay in view + multi-video switching ───
+  (function() {
+    const mediaBoxes = document.querySelectorAll('.sample-media');
+
+    mediaBoxes.forEach(box => {
+      const vids = box.querySelectorAll('.sample-vid');
+      if (!vids.length) return;
+      const caption = box.querySelector('.sample-video-caption');
+      const captions = (box.dataset.captions || '').split('|');
+      const dots = box.querySelectorAll('.sample-video-dot');
+      const prev = box.querySelector('.sample-video-arrow.prev');
+      const next = box.querySelector('.sample-video-arrow.next');
+      let idx = 0;
+
+      function show(i) {
+        idx = (i + vids.length) % vids.length;
+        vids.forEach((v, j) => {
+          v.classList.toggle('active', j === idx);
+          if (j === idx) {
+            try { v.currentTime = 0; v.play().catch(()=>{}); } catch(e) {}
+          } else {
+            try { v.pause(); } catch(e) {}
+          }
+        });
+        dots.forEach((d, j) => d.classList.toggle('active', j === idx));
+        if (caption && captions[idx]) caption.textContent = captions[idx];
+      }
+
+      if (prev) prev.addEventListener('click', (e) => { e.stopPropagation(); show(idx - 1); });
+      if (next) next.addEventListener('click', (e) => { e.stopPropagation(); show(idx + 1); });
+
+      // Autoplay first video when box enters viewport
+      const vio = new IntersectionObserver((entries) => {
+        entries.forEach(e => {
+          const activeVid = vids[idx];
+          if (e.isIntersecting) {
+            try { activeVid.play().catch(()=>{}); } catch(err) {}
+          } else {
+            vids.forEach(v => { try { v.pause(); } catch(err) {} });
+          }
+        });
+      }, { threshold: 0.3 });
+      vio.observe(box);
+
+      // init
+      vids[0].classList.add('active');
+    });
+  })();
+
+})();
+</script>
+
+</body>
+</html>
