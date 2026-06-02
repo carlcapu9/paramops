@@ -416,27 +416,10 @@ body {
   height: clamp(6px, 0.8vw, 10px);
 }
 
-/* ─── INTERACTIVE: Hover glow on sample media ─── */
+/* ─── Sample media (no hover effects, for performance) ─── */
 .sample-media {
-  transition: border-color 0.4s ease, box-shadow 0.4s ease, transform 0.4s cubic-bezier(0.16, 1, 0.3, 1);
-  cursor: pointer;
+  cursor: default;
 }
-.sample-media::after {
-  content: "";
-  position: absolute;
-  inset: -1px;
-  border-radius: 10px;
-  opacity: 0;
-  transition: opacity 0.4s ease;
-  background: radial-gradient(circle at var(--mx, 50%) var(--my, 50%), rgba(90, 143, 214, 0.25) 0%, transparent 60%);
-  pointer-events: none;
-  z-index: 1;
-}
-.sample-media:hover {
-  border-color: var(--accent);
-  box-shadow: 0 0 40px -8px rgba(90, 143, 214, 0.4), 0 0 0 1px rgba(90, 143, 214, 0.3);
-}
-.sample-media:hover::after { opacity: 1; }
 
 /* ─── INTERACTIVE: 3D tilt support ─── */
 .tilt {
@@ -1206,7 +1189,7 @@ body {
     <div class="sample-row reveal">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Default</span></h3>
-        <p class="sample-desc letter-zoom">The main module that repeats along the curve. It stretches and adapts to fit any length.</p>
+        <p class="sample-desc">The main module that repeats along the curve. It stretches and adapts to fit any length.</p>
       </div>
       <div class="sample-media magnetic" data-captions="default"><video class="sample-vid active" data-src="images/Default.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>default</div></div>
     </div>
@@ -1214,7 +1197,7 @@ body {
     <div class="sample-row reveal reverse">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Start &amp; End</span></h3>
-        <p class="sample-desc letter-zoom">Samples placed at the beginning and at the end of the scatter to close it cleanly.</p>
+        <p class="sample-desc">Samples placed at the beginning and at the end of the scatter to close it cleanly.</p>
       </div>
       <div class="sample-media magnetic" data-captions="start & end"><video class="sample-vid active" data-src="images/Start_End.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>start & end</div></div>
     </div>
@@ -1222,7 +1205,7 @@ body {
     <div class="sample-row reveal">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Evenly</span></h3>
-        <p class="sample-desc letter-zoom">A module placed at regular intervals along the curve.</p>
+        <p class="sample-desc">A module placed at regular intervals along the curve.</p>
       </div>
       <div class="sample-media magnetic" data-captions="evenly|spacing"><video class="sample-vid active" data-src="images/Evenly.mp4" muted loop playsinline preload="none" data-index="0"></video><video class="sample-vid" data-src="images/Evenly_Spacing.mp4" muted loop playsinline preload="none" data-index="1"></video><div class="sample-video-caption" data-captions>evenly</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
     </div>
@@ -1230,7 +1213,7 @@ body {
     <div class="sample-row reveal reverse">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Corner</span></h3>
-        <p class="sample-desc letter-zoom">A sample placed at the corners of the curve.</p>
+        <p class="sample-desc">A sample placed at the corners of the curve.</p>
       </div>
       <div class="sample-media magnetic" data-captions="corner|slide"><video class="sample-vid active" data-src="images/Corner.mp4" muted loop playsinline preload="none" data-index="0"></video><video class="sample-vid" data-src="images/Corner_Slide.mp4" muted loop playsinline preload="none" data-index="1"></video><div class="sample-video-caption" data-captions>corner</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
     </div>
@@ -1238,7 +1221,7 @@ body {
     <div class="sample-row reveal">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Segment IDs</span></h3>
-        <p class="sample-desc letter-zoom">Change the Default sample in parts of the curve. Mix different geometries in one scatter.</p>
+        <p class="sample-desc">Change the Default sample in parts of the curve. Mix different geometries in one scatter.</p>
       </div>
       <div class="sample-media magnetic" data-captions="segment id"><video class="sample-vid active" data-src="images/Segment_ID.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>segment id</div></div>
     </div>
@@ -1246,7 +1229,7 @@ body {
     <div class="sample-row reveal reverse">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Markers</span></h3>
-        <p class="sample-desc letter-zoom">Pin a sample to a specific point of the curve.</p>
+        <p class="sample-desc">Pin a sample to a specific point of the curve.</p>
       </div>
       <div class="sample-media magnetic" data-captions="markers"><video class="sample-vid active" data-src="images/Markers.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>markers</div></div>
     </div>
@@ -1254,7 +1237,7 @@ body {
     <div class="sample-row reveal">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Round Corners</span></h3>
-        <p class="sample-desc letter-zoom">A non-destructive, procedural way to round the corners of your scatter with a custom radius.</p>
+        <p class="sample-desc">A non-destructive, procedural way to round the corners of your scatter with a custom radius.</p>
       </div>
       <div class="sample-media magnetic" data-captions="radius"><video class="sample-vid active" data-src="images/Corner_Radius.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>radius</div></div>
     </div>
@@ -1262,7 +1245,7 @@ body {
     <div class="sample-row reveal reverse">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Vertical &amp; Slopes</span></h3>
-        <p class="sample-desc letter-zoom">Detects climbs and slopes along the curve and orients the scatter upward, following the rise of the path.</p>
+        <p class="sample-desc">Detects climbs and slopes along the curve and orients the scatter upward, following the rise of the path.</p>
       </div>
       <div class="sample-media magnetic" data-captions="vertical|on / off"><video class="sample-vid active" data-src="images/Vertical.mp4" muted loop playsinline preload="none" data-index="0"></video><video class="sample-vid" data-src="images/Vertical_On_Off.mp4" muted loop playsinline preload="none" data-index="1"></video><div class="sample-video-caption" data-captions>vertical</div><div class="sample-video-nav"><button class="sample-video-arrow prev" aria-label="Previous">‹</button><div class="sample-video-dots"><span class="sample-video-dot active"></span><span class="sample-video-dot"></span></div><button class="sample-video-arrow next" aria-label="Next">›</button></div></div>
     </div>
@@ -1270,7 +1253,7 @@ body {
     <div class="sample-row reveal">
       <div class="sample-text">
         <h3 class="sample-name"><span class="accent">Flat Top / Bottom / Center</span></h3>
-        <p class="sample-desc letter-zoom">Keeps the top or bottom of the sample flat when the curve goes up or down a slope.</p>
+        <p class="sample-desc">Keeps the top or bottom of the sample flat when the curve goes up or down a slope.</p>
       </div>
       <div class="sample-media magnetic" data-captions="flat top / bottom"><video class="sample-vid active" data-src="images/Flat_Top_Bottom.mp4" muted loop playsinline preload="none" data-index="0"></video><div class="sample-video-caption" data-captions>flat top / bottom</div></div>
     </div>
@@ -1473,36 +1456,9 @@ body {
   window.addEventListener('resize', updateScrollCurve);
   updateScrollCurve();
 
-  // ─── 4. Hover glow follow-mouse on sample media ───
-  document.querySelectorAll('.sample-media').forEach(el => {
-    el.addEventListener('mousemove', (e) => {
-      const rect = el.getBoundingClientRect();
-      const x = ((e.clientX - rect.left) / rect.width) * 100;
-      const y = ((e.clientY - rect.top) / rect.height) * 100;
-      el.style.setProperty('--mx', x + '%');
-      el.style.setProperty('--my', y + '%');
-    });
-  });
+  // ─── 4. (removed: hover glow follow-mouse on sample media) ───
 
-  // ─── 5. 3D tilt + Magnetic on sample media ───
-  document.querySelectorAll('.sample-media').forEach(el => {
-    el.classList.add('tilt');
-    const maxTilt = 5;
-    const maxMagnet = 8;
-    el.addEventListener('mousemove', (e) => {
-      const rect = el.getBoundingClientRect();
-      const x = (e.clientX - rect.left) / rect.width;
-      const y = (e.clientY - rect.top) / rect.height;
-      const rx = (y - 0.5) * -maxTilt * 2;
-      const ry = (x - 0.5) * maxTilt * 2;
-      const mx = (x - 0.5) * maxMagnet;
-      const my = (y - 0.5) * maxMagnet;
-      el.style.transform = `perspective(900px) rotateX(${rx}deg) rotateY(${ry}deg) translate(${mx}px, ${my}px)`;
-    });
-    el.addEventListener('mouseleave', () => {
-      el.style.transform = 'perspective(900px) rotateX(0) rotateY(0) translate(0, 0)';
-    });
-  });
+  // ─── 5. (removed: 3D tilt + magnetic on sample media) ───
 
   // ─── 6. Hero visual loop replay ───
   const heroVisual = document.querySelector('.hero-visual');
@@ -1516,59 +1472,7 @@ body {
 
   // ─── 7. (removed: cursor trail) ───
 
-  // ─── 7b. Letter zoom on hover (proximity-based) ───
-  document.querySelectorAll('.letter-zoom').forEach(el => {
-    // Split text into words; each word is a nowrap container of chars (no mid-word break)
-    const text = el.textContent;
-    el.textContent = '';
-    const chars = [];
-    const parts = text.split(/(\s+)/);
-    parts.forEach(part => {
-      if (part.length === 0) return;
-      if (/^\s+$/.test(part)) {
-        // whitespace: a single breakable space
-        el.appendChild(document.createTextNode(' '));
-      } else {
-        const word = document.createElement('span');
-        word.className = 'lz-word';
-        part.split('').forEach(ch => {
-          const c = document.createElement('span');
-          c.className = 'lz-char';
-          c.textContent = ch;
-          word.appendChild(c);
-          chars.push(c);
-        });
-        el.appendChild(word);
-      }
-    });
-    const radius = 60;
-    el.addEventListener('mousemove', (e) => {
-      chars.forEach(c => {
-        const r = c.getBoundingClientRect();
-        const cx = r.left + r.width / 2;
-        const cy = r.top + r.height / 2;
-        const dx = e.clientX - cx;
-        const dy = e.clientY - cy;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        if (dist < radius) {
-          const t = 1 - (dist / radius);
-          const scale = 1 + 0.4 * t;
-          const ty = -3 * t;
-          c.style.transform = `scale(${scale}) translateY(${ty}px)`;
-          c.style.color = t > 0.5 ? 'var(--accent)' : '';
-        } else {
-          c.style.transform = '';
-          c.style.color = '';
-        }
-      });
-    });
-    el.addEventListener('mouseleave', () => {
-      chars.forEach(c => {
-        c.style.transform = '';
-        c.style.color = '';
-      });
-    });
-  });
+  // ─── 7b. (removed: letter zoom on hover) ───
 
   // ─── 8. Magnetic effect on .magnetic elements ───
   document.querySelectorAll('.magnetic').forEach(el => {
@@ -1693,18 +1597,7 @@ body {
       if (prev) prev.addEventListener('click', (e) => { e.stopPropagation(); show(idx - 1); });
       if (next) next.addEventListener('click', (e) => { e.stopPropagation(); show(idx + 1); });
 
-      // Preload videos when box is near viewport (400px before)
-      const preloadIO = new IntersectionObserver((entries) => {
-        entries.forEach(e => {
-          if (e.isIntersecting) {
-            loadVideos();
-            preloadIO.unobserve(box);
-          }
-        });
-      }, { rootMargin: '400px 0px 400px 0px' });
-      preloadIO.observe(box);
-
-      // Play/pause active video based on visibility
+      // Load + play ONLY when the box is actually on screen; pause and unload when it leaves.
       const playIO = new IntersectionObserver((entries) => {
         entries.forEach(e => {
           if (e.isIntersecting) {
@@ -1712,10 +1605,11 @@ body {
             const activeVid = vids[idx];
             try { activeVid.play().catch(()=>{}); } catch(err) {}
           } else {
+            // Pause all videos in this box when it scrolls out of view
             vids.forEach(v => { try { v.pause(); } catch(err) {} });
           }
         });
-      }, { threshold: 0.3 });
+      }, { threshold: 0.5 });
       playIO.observe(box);
 
       // init
