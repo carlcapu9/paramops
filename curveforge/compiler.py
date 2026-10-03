@@ -303,12 +303,14 @@ class Compiler:
 
         if node.source == "OBJECT":
             if node.object is None:
+                self.warnings.append("'%s': choose an object" % (node.label or node.name))
                 return None
             geo = geo_of(node.object)
             seg = make([(geo, np.eye(4))] if geo is not None else [], node.object.name)
             return g.Fixed(seg) if seg is not None else None
         col = node.collection
         if col is None:
+            self.warnings.append("'%s': choose a collection" % (node.label or node.name))
             return None
         objs = sorted((o for o in col.all_objects if o.type in MESH_LIKE), key=lambda o: o.name)
         if node.collection_mode == "COMBINE":
@@ -347,8 +349,17 @@ class Compiler:
 
     def generator(self, node):
         jobs = []
-        for up_node, _out in self.upstream_all(node.inputs.get("Spline")):
-            if up_node.bl_idname != "CF_NodeSpline" or up_node.mute or up_node.curve is None:
+        label = node.label or node.name
+        splines = [n for n, _out in self.upstream_all(node.inputs.get("Spline"))
+                   if n.bl_idname == "CF_NodeSpline" and not n.mute]
+        if not splines:
+            self.warnings.append("'%s' has no Spline connected" % label)
+        if not any(node.inputs[n].links for n in GEN_INPUTS if node.inputs.get(n) is not None):
+            self.warnings.append("'%s': connect a Segment to Default (or Start, End, Corner, Evenly, Marker)"
+                                 % label)
+        for up_node in splines:
+            if up_node.curve is None:
+                self.warnings.append("'%s': choose a curve" % (up_node.label or up_node.name))
                 continue
             curve = up_node.curve
             self.deps.add(curve)

@@ -88,8 +88,6 @@ def rebuild(obj, depsgraph=None):
             inv = np.array(obj.matrix_world.inverted(), dtype=np.float64)
             cache = {}
             for gen in gens:
-                if not gen.jobs:
-                    errors.append("'%s' has no Spline connected" % gen.node.name)
                 n, trunc, _ = run(gen.jobs, gen.sources, gen.settings_for, gen.place, asm, inv,
                                   clip=gen.clip, seed=gen.seed, slice_cache=cache)
                 count += n
