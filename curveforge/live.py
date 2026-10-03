@@ -49,12 +49,42 @@ def request(obj):
         rebuild(obj)
 
 
-def tree_changed(tree):
+_pending = set()
+
+
+def tree_changed(tree, deferred=False):
+    """Rebuild the objects using ``tree``.
+
+    Changes reported by the tree update callback (links and nodes added or
+    removed) are deferred to a timer: rebuilding inside that callback is unsafe
+    (Blender is still updating the tree) and several changes get merged.
+    """
     if _busy() or tree is None:
+        return
+    if deferred:
+        _pending.add(tree.as_pointer())
+        if not bpy.app.timers.is_registered(_flush_timer):
+            bpy.app.timers.register(_flush_timer, first_interval=0.0)
         return
     for obj in output.users_of(tree):
         if obj.cf_scatter.live:
             rebuild(obj)
+
+
+def flush():
+    """Run the deferred rebuilds now."""
+    if not _pending or _busy():
+        return
+    pointers = set(_pending)
+    _pending.clear()
+    for tree in bpy.data.node_groups:
+        if tree.as_pointer() in pointers:
+            tree_changed(tree)
+
+
+def _flush_timer():
+    flush()
+    return None
 
 
 def style_dependencies(tree, _seen=None):
@@ -153,4 +183,7 @@ def unregister():
         lst = getattr(bpy.app.handlers, name)
         while fn in lst:
             lst.remove(fn)
+    if bpy.app.timers.is_registered(_flush_timer):
+        bpy.app.timers.unregister(_flush_timer)
+    _pending.clear()
     meshio.clear_cache()

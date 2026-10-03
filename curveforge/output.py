@@ -9,7 +9,7 @@ import numpy as np
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty, StringProperty
 from bpy.types import PropertyGroup
 
-from . import meshio
+from . import instancer, meshio
 from .compiler import Compiler
 from .engine.generate import run
 from .engine.mesh import Assembler
@@ -101,8 +101,9 @@ def rebuild(obj, depsgraph=None):
         if obj.data.users > 1 and not obj.data.library:
             obj.data = obj.data.copy()
         meshio.write_mesh(obj.data, mesh)
-        if weld > 0.0 and len(mesh.co):
+        if weld > 0.0 and len(mesh.co) and not mesh.instances:
             meshio.weld(obj.data, weld)
+        instancer.sync(obj, mesh.instances)
         st.stat_segments = count
         st.stat_verts = len(obj.data.vertices)
         st.stat_faces = len(obj.data.polygons)
@@ -118,6 +119,45 @@ def rebuild(obj, depsgraph=None):
     st.stat_time = time.perf_counter() - t0
     DEPENDENCIES[obj.session_uid] = deps
     return ok
+
+
+def release_styles():
+    """Take the styles out of the dependency graphs before the node types go away.
+
+    The ``style`` pointer makes every depsgraph keep an evaluated copy of the node
+    tree, and Blender 4.2 crashes when it frees a copy whose node types were
+    unregistered (disable the add-on, then open a file). Clearing the pointers
+    through RNA rebuilds the relations; ``restore_styles`` puts them back as plain
+    ID properties once the classes are unregistered.
+    """
+    from . import live
+    held = []
+    with live.suspended():
+        for obj in bpy.data.objects:
+            try:
+                tree = obj.cf_scatter.style
+                if tree is not None:
+                    obj.cf_scatter.style = None
+                    held.append((obj, tree))
+            except (AttributeError, RuntimeError, TypeError, ReferenceError):  # e.g. linked data
+                continue
+        if held:
+            for scene in bpy.data.scenes:
+                for layer in scene.view_layers:
+                    if layer.depsgraph is not None:
+                        layer.update()
+    return held
+
+
+def restore_styles(held):
+    for obj, tree in held:
+        try:
+            # Blender 5.0 keeps the data of add-on properties apart from custom properties.
+            get = getattr(obj, "bl_system_properties_get", None)
+            props = get() if get is not None else obj
+            props["cf_scatter"]["style"] = tree
+        except (KeyError, TypeError, ReferenceError):
+            pass
 
 
 classes = (CF_ObjectSettings,)

@@ -14,6 +14,9 @@ TREE_ID = "CF_StyleTree"
 MESH_LIKE = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
 
 
+_registering = [False]
+
+
 def _changed(self, context):
     from . import live
     live.tree_changed(self.id_data)
@@ -28,10 +31,14 @@ class CF_StyleTree(NodeTree):
 
     def update(self):
         from . import live
+        if _registering[0]:
+            # Blender updates the trees while each node class is (un)registered: the
+            # nodes are only half defined then.
+            return
         for node in self.nodes:
             if hasattr(node, "cf_sync_inputs"):
                 node.cf_sync_inputs()
-        live.tree_changed(self)
+        live.tree_changed(self, deferred=True)
 
 
 TRI_STATE = [("DEFAULT", "Default", "Use the setting of the generator"),
@@ -953,10 +960,18 @@ classes = (CF_StyleTree,) + node_classes
 
 
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
+    _registering[0] = True
+    try:
+        for cls in classes:
+            bpy.utils.register_class(cls)
+    finally:
+        _registering[0] = False
 
 
 def unregister():
-    for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+    _registering[0] = True
+    try:
+        for cls in reversed(classes):
+            bpy.utils.unregister_class(cls)
+    finally:
+        _registering[0] = False

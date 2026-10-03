@@ -204,14 +204,19 @@ class ExprNum(Num):
 # ---------------------------------------------------------------------------
 
 class Geo:
-    """Geometry of one source object (local space) and its bounding box."""
+    """Geometry of one source object and its bounding box.
 
-    __slots__ = ("key", "mesh", "bmin", "bmax")
+    ``inst`` is ``(object_name, matrix)`` when the geometry can be replaced by
+    an instance of that object: ``mesh.co == matrix @ object-local positions``.
+    """
 
-    def __init__(self, key, mesh):
+    __slots__ = ("key", "mesh", "bmin", "bmax", "inst")
+
+    def __init__(self, key, mesh, inst=None):
         self.key = key
         self.mesh = mesh
         self.bmin, self.bmax = mesh.bbox()
+        self.inst = inst
 
 
 def _box_corners(bmin, bmax):

@@ -9,7 +9,7 @@ from .engine.mesh import ATTRIBUTE_TYPES, MeshBuf
 
 VALUE_KEY = {"FLOAT": "value", "INT": "value", "INT8": "value", "BOOLEAN": "value", "INT32_2D": "value",
              "QUATERNION": "value", "FLOAT_VECTOR": "vector", "FLOAT2": "vector", "FLOAT_COLOR": "color",
-             "BYTE_COLOR": "color"}
+             "BYTE_COLOR": "color", "FLOAT4X4": "value"}
 SEAM_NAMES = ("uv_seam", ".uv_seam")
 SEAM_WRITE = "uv_seam" if bpy.app.version >= (5, 0, 0) else ".uv_seam"
 
@@ -74,6 +74,8 @@ def read_mesh(me, materials=None):
             seams = s if s.any() else None
             continue
         if name.startswith(".") or name in {"position", "material_index"} or name in uv_names:
+            continue
+        if name in {"cf_is_instance", "cf_instance", "cf_matrix"}:
             continue
         if at.data_type not in ATTRIBUTE_TYPES or at.domain not in {"POINT", "EDGE", "FACE", "CORNER"}:
             continue

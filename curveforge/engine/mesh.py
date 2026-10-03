@@ -8,7 +8,7 @@ ATTRIBUTE_TYPES = {
     "FLOAT": (np.float32, 1), "INT": (np.int32, 1), "INT8": (np.int32, 1),
     "BOOLEAN": (np.bool_, 1), "FLOAT_VECTOR": (np.float32, 3), "FLOAT2": (np.float32, 2),
     "FLOAT_COLOR": (np.float32, 4), "BYTE_COLOR": (np.float32, 4), "INT32_2D": (np.int32, 2),
-    "QUATERNION": (np.float32, 4),
+    "QUATERNION": (np.float32, 4), "FLOAT4X4": (np.float32, 16),
 }
 
 
@@ -101,10 +101,10 @@ class MeshBuf:
 
 
 class Mesh:
-    """Assembled result."""
+    """Assembled result. ``instances`` lists the object names used by instance points."""
 
     __slots__ = ("co", "corner_vert", "corner_edge", "face_start", "edges", "face_mat", "materials",
-                 "uvs", "attrs", "seams")
+                 "uvs", "attrs", "seams", "instances")
 
 
 def _material_key(mat):
@@ -121,6 +121,18 @@ class Assembler:
         self.batches = []
         self.materials = []
         self._mat_index = {}
+        self.inst_names = []
+        self.inst_index = []
+        self.inst_mats = []
+
+    def add_instances(self, name, matrices):
+        """Instances of object ``name`` with world (or output-local) 4x4 matrices."""
+        if name not in self.inst_names:
+            self.inst_names.append(name)
+        idx = self.inst_names.index(name)
+        matrices = np.asarray(matrices, dtype=np.float64).reshape(-1, 4, 4)
+        self.inst_index.append(np.full(len(matrices), idx, dtype=np.int32))
+        self.inst_mats.append(matrices)
 
     def material_index(self, mat):
         key = _material_key(mat)
@@ -247,6 +259,28 @@ class Assembler:
             npdt, comps = ATTRIBUTE_TYPES[dt]
             out.attrs[name] = (dom, dt, cat(attrs[name], () if comps == 1 else (comps,), npdt))
         out.seams = cat(seams, (), np.bool_) if any_seam else None
+        out.instances = list(self.inst_names)
+        if self.inst_mats:
+            mats = np.concatenate(self.inst_mats)
+            idx = np.concatenate(self.inst_index)
+            n_old = len(out.co)
+            k = len(mats)
+            out.co = np.vstack([out.co, mats[:, :3, 3]])
+            for name, (dom, dt, arr) in list(out.attrs.items()):
+                if dom == "POINT":
+                    pad = np.zeros((k,) + arr.shape[1:], dtype=arr.dtype)
+                    out.attrs[name] = (dom, dt, np.concatenate([arr, pad]))
+            flag = np.zeros(n_old + k, dtype=np.bool_)
+            flag[n_old:] = True
+            index = np.full(n_old + k, -1, dtype=np.int32)
+            index[n_old:] = idx
+            # Blender stores 4x4 matrices column by column.
+            mat_attr = np.zeros((n_old + k, 16), dtype=np.float32)
+            mat_attr[:n_old] = np.eye(4, dtype=np.float32).T.ravel()
+            mat_attr[n_old:] = np.transpose(mats, (0, 2, 1)).reshape(k, 16)
+            out.attrs["cf_is_instance"] = ("POINT", "BOOLEAN", flag)
+            out.attrs["cf_instance"] = ("POINT", "INT", index)
+            out.attrs["cf_matrix"] = ("POINT", "FLOAT4X4", mat_attr)
         return out
 
 

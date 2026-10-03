@@ -18,6 +18,7 @@ class PlaceOptions:
         self.offset_z = 0.0
         self.uv_mode = "KEEP"     # KEEP RAIL
         self.uv_scale = 1.0
+        self.instance = False     # rigid segments become instances (segments can override)
         self.slicer = None        # callable(buf, plane_co, plane_no, keep_positive) -> buf
         for k, v in kw.items():
             if not hasattr(self, k):
@@ -76,6 +77,7 @@ def place(rail, placed, opts, asm, inv_matrix=None, slice_cache=None):
     if slice_cache is None:
         slice_cache = {}
     batches = {}
+    inst_batches = {}
     for pl in placed:
         seg = pl.seg
         if not seg.parts:
@@ -84,11 +86,16 @@ def place(rail, placed, opts, asm, inv_matrix=None, slice_cache=None):
         upright = opts.upright if seg.upright is None else seg.upright
         xref, xshift = _x_ref(seg, pl.kind, pl.inp)
         yref, zref = _yz_ref(seg)
+        instanced = ((opts.instance if seg.instance is None else seg.instance) and not bend
+                     and pl.cut is None and not seg.materials and seg.uv is None and opts.uv_mode != "RAIL")
         for geo, m in seg.parts:
             it = _Item()
             it.geo, it.m, it.pl, it.seg = geo, m, pl, seg
             it.bend, it.upright = bend, upright
             it.xref, it.xshift, it.yref, it.zref = xref, xshift, yref, zref
+            if instanced and geo.inst is not None:
+                inst_batches.setdefault((geo.inst[0], id(geo), pl.kind, upright, seg.orient), []).append(it)
+                continue
             buf = geo.mesh
             cut_key = None
             if pl.cut is not None and pl.kind == SPAN and (seg.slice if seg.slice is not None else opts.slice):
@@ -103,6 +110,8 @@ def place(rail, placed, opts, asm, inv_matrix=None, slice_cache=None):
             entry[1].append(it)
     for buf, items in batches.values():
         _emit(rail, buf, items, opts, asm, inv_matrix)
+    for items in inst_batches.values():
+        _emit_instances(rail, items, opts, asm, inv_matrix)
 
 
 def _sliced(it, pl, opts, cache):
@@ -219,3 +228,71 @@ def _emit(rail, buf, items, opts, asm, inv_matrix):
                 uvx[i] = it.seg.uv
     u_rail = s * opts.uv_scale if opts.uv_mode == "RAIL" else None
     asm.add(buf, pos, flip, overrides=items[0].seg.materials, uv=uvx, u_override=u_rail)
+
+
+def _rigid_frames(rail, items, opts):
+    """Affine maps (n, 4, 4) from segment space to world for rigid placements."""
+    n = len(items)
+    pls = [it.pl for it in items]
+    offs = np.array([it.seg.offset for it in items], dtype=np.float64)
+    yref = np.array([it.yref for it in items])
+    zref = np.array([it.zref for it in items])
+    xref = np.array([it.xref for it in items])
+    oy = offs[:, 1] + opts.offset_y - yref
+    oz = offs[:, 2] + opts.offset_z - zref
+    upright = items[0].upright
+    A = np.zeros((n, 4, 4))
+    A[:, 3, 3] = 1.0
+    if pls[0].kind == SPAN:
+        x0 = np.array([p.x0 for p in pls]) + offs[:, 0]
+        k = np.array([p.k for p in pls])
+        shift = np.array([it.xshift for it in items])
+        core = np.array([(it.seg.size or float(it.seg.bmax[0] - it.seg.bmin[0])) for it in items])
+        sa = x0 + (np.array([float(it.seg.bmin[0]) for it in items]) - xref + shift) * k
+        sb = sa + np.maximum(core, 1e-9) * k
+        p0 = rail.position(sa)
+        chord = rail.position(sb) - p0
+        span = np.maximum(sb - sa, 1e-12)
+        a = k / span
+        b = (x0 + (shift - xref) * k - sa) / span
+        if upright:
+            h = chord.copy()
+            h[:, 2] = 0.0
+            left = np.stack([-h[:, 1], h[:, 0], np.zeros(n)], axis=1)
+            ln = np.linalg.norm(left, axis=1)
+            bad = ln < 1e-12
+            if bad.any():
+                left[bad] = rail.frames((sa + sb)[bad] * 0.5, upright=True)[2]
+                ln[bad] = 1.0
+            left /= ln[:, None]
+            up = np.broadcast_to((0.0, 0.0, 1.0), (n, 3))
+        else:
+            _o, fwd, left, _u = rail.frames((sa + sb) * 0.5)
+            cl = np.linalg.norm(chord, axis=1)
+            d = np.where(cl[:, None] > 1e-12, chord / np.maximum(cl, 1e-12)[:, None], fwd)
+            left = left - np.einsum("ij,ij->i", left, d)[:, None] * d
+            left /= np.maximum(np.linalg.norm(left, axis=1), 1e-12)[:, None]
+            up = np.cross(d, left)
+        A[:, :3, 0] = chord * a[:, None]
+        A[:, :3, 1] = left
+        A[:, :3, 2] = up
+        A[:, :3, 3] = p0 + chord * b[:, None] + left * oy[:, None] + up * oz[:, None]
+    else:
+        anchor = np.array([p.anchor for p in pls]) + offs[:, 0]
+        o, fwd, left, up = rail.frames(anchor, upright=upright, orient=items[0].seg.orient)
+        A[:, :3, 0] = fwd
+        A[:, :3, 1] = left
+        A[:, :3, 2] = up
+        A[:, :3, 3] = o - fwd * xref[:, None] + left * oy[:, None] + up * oz[:, None]
+    return A
+
+
+def _emit_instances(rail, items, opts, asm, inv_matrix):
+    """Rigid copies as instances of the source object (no geometry is generated)."""
+    A = _rigid_frames(rail, items, opts)
+    parts = np.stack([it.m for it in items])
+    name, local = items[0].geo.inst
+    mats = A @ parts @ np.asarray(local, dtype=np.float64)
+    if inv_matrix is not None:
+        mats = np.asarray(inv_matrix, dtype=np.float64) @ mats
+    asm.add_instances(name, mats)

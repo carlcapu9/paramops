@@ -20,8 +20,8 @@ bl_info = {
 if "bpy" in locals():
     import importlib
     for _m in (engine_spline, engine_rail, engine_expr, engine_graph, engine_linear, engine_mesh,  # noqa: F821
-               engine_place, engine_generate, sockets, nodes, meshio, curvedata, compiler, output,  # noqa: F821
-               live, ops, templates, menus, ui):  # noqa: F821
+               engine_place, engine_generate, sockets, nodes, meshio, curvedata, compiler, instancer,  # noqa: F821
+               output, live, ops, templates, menus, ui):  # noqa: F821
         importlib.reload(_m)
 
 import bpy  # noqa: E402,F401
@@ -34,7 +34,7 @@ from .engine import linear as engine_linear  # noqa: E402
 from .engine import mesh as engine_mesh  # noqa: E402
 from .engine import place as engine_place  # noqa: E402
 from .engine import generate as engine_generate  # noqa: E402
-from . import sockets, nodes, meshio, curvedata, compiler, output, live, ops, templates, menus, ui  # noqa: E402
+from . import sockets, nodes, meshio, curvedata, compiler, instancer, output, live, ops, templates, menus, ui  # noqa: E402,E501
 
 _MODULES = (sockets, nodes, curvedata, output, ops, menus, ui, live)
 
@@ -45,5 +45,7 @@ def register():
 
 
 def unregister():
+    held = output.release_styles()
     for mod in reversed(_MODULES):
         mod.unregister()
+    output.restore_styles(held)

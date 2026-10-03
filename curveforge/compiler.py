@@ -292,9 +292,14 @@ class Compiler:
             if buf is None:
                 return None
             if self.display == "BOX":
-                buf = self._box(buf)
-                key = key + ("box",)
-            return g.Geo(key, buf)
+                return g.Geo(key + ("box",), self._box(buf))
+            m = np.array(obj.matrix_world, dtype=np.float64)
+            if not world:
+                rot = np.eye(4)
+                if node.use_transform:
+                    rot[:3, :3] = m[:3, :3]
+                m = rot
+            return g.Geo(key, buf, inst=(obj.name, m))
 
         if node.source == "OBJECT":
             if node.object is None:
@@ -381,7 +386,8 @@ class Compiler:
         job.place = PlaceOptions(bend=node.bend, upright=node.upright, slice=node.slice,
                                  offset_y=self.num(node.inputs.get("Offset Y"))(neutral),
                                  offset_z=self.num(node.inputs.get("Offset Z"))(neutral),
-                                 uv_mode=node.uv_mode, uv_scale=node.uv_scale, slicer=meshio.slicer)
+                                 uv_mode=node.uv_mode, uv_scale=node.uv_scale, slicer=meshio.slicer,
+                                 instance=node.instance)
         job.clip = None
         if node.clip_curve is not None:
             self.deps.add(node.clip_curve)

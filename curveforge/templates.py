@@ -175,7 +175,7 @@ def fence(env):
         spl = add_node(t, "CF_NodeSpline", (-560, 220), curve=curve)
         n_panel = add_node(t, "CF_NodeSegment", (-560, 20), label="Panel", object=panel, align_z="MIN")
         n_post = add_node(t, "CF_NodeSegment", (-560, -230), label="Post", object=post, align_z="MIN",
-                          bend="OFF", upright="ON")
+                          bend="OFF", upright="ON", instance="ON")
         gen = add_node(t, "CF_NodeLinear", (-60, 160), upright=True, cf_panel=True)
         gen.inputs["Evenly Distance"].default_value = 4.0
         link(t, spl, "Spline", gen, "Spline")

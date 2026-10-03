@@ -201,6 +201,14 @@ class CF_OT_bake(Operator):
                 col.objects.link(target)
         target.cf_scatter.enabled = False
         target.cf_scatter.style = None
+        if target.modifiers.get("CurveForge Instances") is not None:
+            # Realize the instances into real geometry.
+            for o in context.selected_objects:
+                o.select_set(False)
+            target.select_set(True)
+            context.view_layer.objects.active = target
+            bpy.ops.object.convert(target="MESH")
+            target = context.view_layer.objects.active
         for o in context.selected_objects:
             o.select_set(False)
         target.select_set(True)

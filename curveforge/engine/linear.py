@@ -260,26 +260,28 @@ class _Run:
                 cur_b = b - ln
 
         breaks = self.breaks(cur_a, cur_b)
+        # Sections: free range (g0, g1) and the anchor positions (m0, m1) that Evenly
+        # distances are measured from (spline ends and corner / marker points).
         sections = []
         if cyclic:
             if not breaks:
-                sections.append((0.0, L))
+                sections.append((0.0, L, 0.0, L))
             for j, (pos, before, after) in enumerate(breaks):
                 npos, nbefore, _ = breaks[(j + 1) % len(breaks)]
-                g1 = npos - nbefore + (L if j == len(breaks) - 1 else 0.0)
-                sections.append((pos + after, g1))
+                wrap = L if j == len(breaks) - 1 else 0.0
+                sections.append((pos + after, npos - nbefore + wrap, pos, npos + wrap))
         else:
-            prev = cur_a
+            prev, mark = cur_a, a
             for pos, before, after in breaks:
-                sections.append((prev, pos - before))
-                prev = pos + after
-            sections.append((prev, cur_b))
+                sections.append((prev, pos - before, mark, pos))
+                prev, mark = pos + after, pos
+            sections.append((prev, cur_b, mark, b))
 
         evenly_all = None
         if st.evenly_scope == "SPLINE" and self.sources.get(INPUT_EVENLY) is not None:
-            evenly_all = self.evenly_positions(cur_a, cur_b) if not cyclic else self.evenly_positions(0.0, L)
-        for g0, g1 in sections:
-            self.fill_section(g0, g1, evenly_all)
+            evenly_all = self.evenly_positions(a, b) if not cyclic else self.evenly_positions(0.0, L)
+        for g0, g1, m0, m1 in sections:
+            self.fill_section(g0, g1, evenly_all, m0, m1)
             self.section += 1
         if self.clip is not None:
             self.apply_clip()
@@ -351,19 +353,18 @@ class _Run:
             pos += d
         return out
 
-    def fill_section(self, g0, g1, evenly_all):
+    def fill_section(self, g0, g1, evenly_all, m0=None, m1=None):
         evenly = self.sources.get(INPUT_EVENLY)
         spans = []
         if evenly is not None:
             if evenly_all is not None:
                 period = self.L if self.rail.cyclic else 0.0
-                positions = []
+                candidates = []
                 for p in evenly_all:
-                    for q in ((p, p + period) if period else (p,)):
-                        if g0 + EPS < q < g1 - EPS:
-                            positions.append(q)
+                    candidates.extend((p, p + period) if period else (p,))
             else:
-                positions = self.evenly_positions(g0, g1)
+                candidates = self.evenly_positions(g0 if m0 is None else m0, g1 if m1 is None else m1)
+            positions = [q for q in candidates if g0 + EPS < q < g1 - EPS]
             for pos in positions:
                 pl = self.anchor(INPUT_EVENLY, pos, None)
                 if pl is None:

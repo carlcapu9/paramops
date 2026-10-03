@@ -70,6 +70,7 @@ def panel(length=1.0, height=1.0, nx=4):
 
 
 def coords(ob):
+    live.flush()
     co = np.zeros(len(ob.data.vertices) * 3, np.float32)
     ob.data.vertices.foreach_get("co", co)
     m = np.array(ob.matrix_world)
@@ -164,6 +165,7 @@ def test_operators_sequence_randomize_conditional_selector():
     tree.links.new(na.outputs[0], seq.inputs[0])
     tree.links.new(nb.outputs[0], seq.inputs[1])
     tree.links.new(seq.outputs[0], gen.inputs["Default"])
+    live.flush()
     assert len(seq.inputs) == 3  # a free socket was added
     seq.inputs[0].count = 2
     assert tall_modules(obj) == [2, 5]
@@ -223,6 +225,7 @@ def test_compose_mirror_transform_material_uv_and_numbers():
     tree.links.new(val.outputs[0], math_n.inputs["A"])
     math_n.inputs["B"].default_value = 2.0
     tree.links.new(math_n.outputs[0], gen.inputs["Spacing"])
+    live.flush()
     assert obj.cf_scatter.stat_segments == 3
 
 
@@ -359,3 +362,33 @@ def test_muted_nodes_and_reroutes_pass_through():
     mir.mute = True
     live.tree_changed(tree)
     assert coords(obj)[:, 2].min() == pytest.approx(0.0)
+
+
+def test_instancing_rigid_segments():
+    c = curve_obj("C", [(0, 0, 0), (6, 0, 0), (6, 6, 0)])
+    obj, tree = scatter(c, mesh_obj("Panel", panel(1.0)))
+    post = mesh_obj("Post", box(-0.05, 0.05, -0.05, 0.05, 0.0, 1.5))
+    post.rotation_euler.z = 0.0
+    n_post = add(tree, "CF_NodeSegment", object=post, bend="OFF", instance="ON")
+    gen = node(tree, "CF_NodeLinear")
+    for name in ("Start", "End", "Corner", "Evenly"):
+        tree.links.new(n_post.outputs[0], gen.inputs[name])
+    live.flush()
+    mod = obj.modifiers.get("CurveForge Instances")
+    assert mod is not None and mod.node_group is not None
+    dg = bpy.context.evaluated_depsgraph_get()
+    # Instance data is only valid while iterating: copy the matrices.
+    mats = [np.array(inst.matrix_world) for inst in dg.object_instances
+            if inst.is_instance and inst.parent and inst.parent.original == obj]
+    assert len(mats) == 7  # start, end, corner and 2 evenly posts per 6 m side
+    for m in mats:
+        assert abs(m[2, 3]) < 1e-5  # posts stand on the curve
+        assert np.allclose(m[:3, 2], (0, 0, 1))  # and are upright
+    locs = {(round(float(m[0, 3]), 3) + 0.0, round(float(m[1, 3]), 3) + 0.0) for m in mats}
+    # Start / End posts occupy the first / last 10 cm; evenly posts are measured from the points.
+    assert {(0.05, 0.0), (2.0, 0.0), (4.0, 0.0), (6.0, 0.0), (6.0, 2.0), (6.0, 4.0), (6.0, 5.95)} == locs
+    # No post geometry in the mesh itself (only panels + instance points).
+    assert coords(obj)[:, 2].max() <= 1.0 + 1e-6
+    n_post.instance = "OFF"
+    assert obj.modifiers.get("CurveForge Instances") is None
+    assert coords(obj)[:, 2].max() == pytest.approx(1.5)
