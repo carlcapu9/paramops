@@ -15,6 +15,7 @@ MESH_LIKE = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
 
 
 _registering = [False]
+MESH_TYPES = {"MESH", "CURVE", "SURFACE", "FONT", "META"}
 
 
 def _changed(self, context):
@@ -262,6 +263,13 @@ class CF_NodeSegment(CFNode, Node):
             layout.prop(self, "collection_mode")
             if self.collection_mode == "RANDOM":
                 layout.prop(self, "seed")
+                if self.collection is not None:
+                    col = layout.column(align=True)
+                    col.label(text="Weights")
+                    objs = sorted((o for o in self.collection.all_objects if o.type in MESH_TYPES),
+                                  key=lambda o: o.name)
+                    for ob in objs[:24]:
+                        col.prop(ob, "cf_weight", text=ob.name)
         layout.prop(self, "use_transform")
         col = layout.column(align=True)
         col.label(text="Deformation")

@@ -72,9 +72,16 @@ def _rect(shader, x0, y0, x1, y1, color):
     batch.draw(shader)
 
 
+def _redraw(self, context):
+    screen = getattr(context, "screen", None)
+    for area in screen.areas if screen is not None else ():
+        if area.type == "VIEW_3D":
+            area.tag_redraw()
+
+
 def register():
     bpy.types.WindowManager.cf_show_ids = BoolProperty(
-        name="Show in Viewport", default=True,
+        name="Show in Viewport", default=True, update=_redraw,
         description="Show the Segment ID of every segment of the curve in Edit Mode")
     _handle[0] = bpy.types.SpaceView3D.draw_handler_add(draw, (), "WINDOW", "POST_PIXEL")
 

@@ -322,6 +322,13 @@ def test_collection_segment_modes():
     bpy.data.objects["B"].cf_weight = 0.0
     seg.collection_mode = "RANDOM"
     assert coords(obj)[:, 2].max() == pytest.approx(1.0)
+    # Changing a weight updates the scatter.
+    bpy.data.objects["A"].cf_weight = 0.0
+    bpy.data.objects["B"].cf_weight = 1.0
+    bpy.context.view_layer.update()
+    assert coords(obj)[:, 2].min() == pytest.approx(0.0)
+    assert coords(obj)[:, 2].max() == pytest.approx(2.0)
+    assert np.isclose(coords(obj)[:, 2], 1.0).sum() == 0
 
 
 def test_templates_build_cleanly():

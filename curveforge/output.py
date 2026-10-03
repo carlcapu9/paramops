@@ -24,6 +24,14 @@ def _changed(self, context):
     live.request(self.id_data)
 
 
+def _weight_changed(self, context):
+    from . import live
+    uid = self.session_uid
+    for obj in outputs(getattr(context, "scene", None)):
+        if uid in DEPENDENCIES.get(obj.session_uid, ()):
+            live.request(obj)
+
+
 def _poll_style(self, tree):
     return tree.bl_idname == TREE_ID
 
@@ -166,7 +174,7 @@ def register():
         bpy.utils.register_class(cls)
     bpy.types.Object.cf_scatter = PointerProperty(type=CF_ObjectSettings)
     bpy.types.Object.cf_weight = FloatProperty(
-        name="Weight", default=1.0, min=0.0, soft_max=10.0,
+        name="Weight", default=1.0, min=0.0, soft_max=10.0, update=_weight_changed,
         description="Probability weight when picked at random from a collection by a Segment node")
 
 

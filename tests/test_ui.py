@@ -85,6 +85,12 @@ def test_every_node_draws():
     seg = tree.nodes.new("CF_NodeSegment")
     seg.source = "COLLECTION"
     seg.draw_buttons_ext(ctx, Recorder([]))
+    col = bpy.data.collections.new("Weights")
+    col.objects.link(bpy.data.objects.new("W", bpy.data.meshes.new("W")))
+    seg.collection = col
+    log = []
+    seg.draw_buttons_ext(ctx, Recorder(log))
+    assert "cf_weight" in log
     gen = tree.nodes.new("CF_NodeLinear")
     for mode in ("VERTICES", "REPEAT"):
         gen.marker_mode = mode
