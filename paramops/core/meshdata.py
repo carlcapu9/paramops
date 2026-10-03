@@ -197,15 +197,16 @@ def _material_key(mat):
 def assemble(groups):
     """Concatenate module copies.
 
-    ``groups``: list of ``(mesh_data, positions (M, V, 3), flip (M,))``. Each
-    module copy uses the topology of ``mesh_data`` with its own positions;
-    flipped modules get reversed face winding.
+    ``groups``: list of ``(mesh_data, positions (M, V, 3), flip (M,)[, uv_offsets (M, 2)])``.
+    Each module copy uses the topology of ``mesh_data`` with its own positions;
+    flipped modules get reversed face winding and UV offsets shift every UV map.
     """
+    groups = [g if len(g) == 4 else (g[0], g[1], g[2], None) for g in groups]
     # Global material list.
     materials = []
     mat_lookup = {}
     luts = []
-    for md, _, _ in groups:
+    for md, _, _, _ in groups:
         lut = []
         for mat in md.materials:
             key = _material_key(mat)
@@ -219,26 +220,26 @@ def assemble(groups):
 
     # Attribute and UV layer union.
     spec = {}
-    for md, _, _ in groups:
+    for md, _, _, _ in groups:
         for name, (dom, dt, _) in md.attrs.items():
             if name not in spec:
                 spec[name] = (dom, dt)
-    n_uv = max((len(md.uvs) for md, _, _ in groups), default=0)
+    n_uv = max((len(md.uvs) for md, _, _, _ in groups), default=0)
     uv_names = []
     for j in range(n_uv):
         nm = None
-        for md, _, _ in groups:
+        for md, _, _, _ in groups:
             if j < len(md.uvs):
                 nm = md.uvs[j][0]
                 break
         uv_names.append(nm or "UVMap.%03d" % j)
-    any_seams = any(md.seams is not None and md.seams.any() for md, _, _ in groups)
+    any_seams = any(md.seams is not None and md.seams.any() for md, _, _, _ in groups)
 
     co_parts, lv_parts, le_parts, fs_parts, ed_parts, mi_parts, seam_parts = [], [], [], [], [], [], []
     uv_parts = [[] for _ in range(n_uv)]
     attr_parts = {name: [] for name in spec}
     v_base = e_base = l_base = 0
-    for gi, (md, pos, flip) in enumerate(groups):
+    for gi, (md, pos, flip, uv_off) in enumerate(groups):
         M = pos.shape[0]
         if M == 0 or md.nf == 0 and md.ne == 0 and md.nv == 0:
             continue
@@ -278,7 +279,10 @@ def assemble(groups):
 
         for j in range(n_uv):
             if j < len(md.uvs):
-                uv_parts[j].append(corner_tile(md.uvs[j][1]))
+                tiled = corner_tile(md.uvs[j][1])
+                if uv_off is not None:
+                    tiled = (tiled.reshape(M, Lc, 2) + np.asarray(uv_off, np.float32)[:, None, :]).reshape(-1, 2)
+                uv_parts[j].append(tiled)
             else:
                 uv_parts[j].append(np.zeros((M * Lc, 2), np.float32))
         for name, (dom, dt) in spec.items():

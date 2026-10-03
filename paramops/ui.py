@@ -5,7 +5,7 @@ import bpy
 from bpy.types import Panel, UIList
 
 from .props import slot_objects
-from .utils import context_scatter, is_scatter, scatters_using
+from .utils import context_scatter, scatters_using
 
 CATEGORY = "ParamOps"
 ANCHORED = {"evenly", "corner", "marker"}
@@ -91,7 +91,9 @@ def draw_slot_options(layout, slot, kind):
     col.prop(slot, "random_scale")
     col.prop(slot, "random_flip_x")
     col.prop(slot, "random_flip_y")
-    col.prop(slot, "seed")
+    col = layout.column(align=True)
+    col.prop(slot, "random_uv")
+    layout.prop(slot, "seed")
 
 
 class _Base:

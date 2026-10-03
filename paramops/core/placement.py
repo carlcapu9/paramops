@@ -24,6 +24,7 @@ class SlotConfig:
         self.random_scale = 0.0                  # +/- fraction (uniform)
         self.random_flip_x = 0.0                 # probability
         self.random_flip_y = 0.0
+        self.random_uv = (0.0, 0.0)              # +/- UV offset per module
         self.flat_top = 0.0
         self.flat_bottom = 0.0
         self.flat_center = 0.0
@@ -45,7 +46,7 @@ class SlotConfig:
         return any(abs(v) > 0 for v in self.random_offset)
 
 
-def _euler_matrix(rx, ry, rz):
+def euler_matrix(rx, ry, rz):
     cx, sx = math.cos(rx), math.sin(rx)
     cy, sy = math.cos(ry), math.sin(ry)
     cz, sz = math.cos(rz), math.sin(rz)
@@ -74,11 +75,23 @@ def random_transforms(cfg, placements, global_seed, path_index):
         sc = 1.0 + rng.uniform(-cfg.random_scale, cfg.random_scale) if cfg.random_scale > 0 else 1.0
         fx = -1.0 if rng.random() < cfg.random_flip_x else 1.0
         fy = -1.0 if rng.random() < cfg.random_flip_y else 1.0
-        rot = _euler_matrix(rng.uniform(-rr[0], rr[0]), rng.uniform(-rr[1], rr[1]),
+        rot = euler_matrix(rng.uniform(-rr[0], rr[0]), rng.uniform(-rr[1], rr[1]),
                             rng.uniform(-rr[2], rr[2]))
         mats[m] = rot @ np.diag((sc * fx, sc * fy, sc))
         flips[m] = (fx * fy) < 0
     return mats, offs, flips
+
+
+def random_uv_offsets(cfg, placements, global_seed, path_index):
+    """Per-module UV offsets (M, 2) or ``None`` when UV randomisation is off."""
+    ru, rv = cfg.random_uv
+    if ru <= 0.0 and rv <= 0.0:
+        return None
+    out = np.zeros((len(placements), 2))
+    for m, p in enumerate(placements):
+        rng = random.Random(stable_seed(global_seed, cfg.seed, path_index, p.slot, p.ordinal, "uv"))
+        out[m] = (rng.uniform(-ru, ru), rng.uniform(-rv, rv))
+    return out
 
 
 def place_group(path, md, placements, cfg, global_seed=0, path_index=0, inv_matrix=None,

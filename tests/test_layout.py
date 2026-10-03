@@ -185,3 +185,19 @@ def test_paddings_extend_footprint():
     assert ds[0].x0 == pytest.approx(0.25)
     assert ds[0].k == pytest.approx(1.0)
     assert all(p.kind == SPAN for p in ds)
+
+
+def test_marker_replaces_corner_at_same_point():
+    slots = {"default": slot("default", 1.0), "corner": slot("corner", 0.2), "marker:0": slot("marker:0", 1.0)}
+    res = layout_path(PathInfo(8.0, corners=[4.0], markers=[(4.0, "marker:0")]), slots, LayoutSettings())
+    assert not spans(res, "corner")
+    assert len(spans(res, "marker:0")) == 1
+
+
+def test_disabled_segment_id_falls_back_to_default():
+    bounds = [(0.0, 3.0, -1), (3.0, 6.0, 0)]
+    seg = slot("seg:0", 0.5)
+    seg.active = False
+    res = layout_path(PathInfo(6.0, seg_bounds=bounds), {"default": slot("default", 1.0), "seg:0": seg},
+                      LayoutSettings())
+    assert covered(spans(res, "default")) == pytest.approx(6.0)

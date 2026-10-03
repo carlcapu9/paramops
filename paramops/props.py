@@ -182,6 +182,10 @@ class POPS_SampleSlot(PropertyGroup):
     random_flip_y: FloatProperty(name="Random Flip Y", default=0.0, min=0.0, max=1.0, subtype="FACTOR",
                                  update=_update, description="Probability of mirroring across the curve")
 
+    random_uv: FloatVectorProperty(name="Random UV Offset", size=2, min=0.0, default=(0.0, 0.0),
+                                   update=_update,
+                                   description="Shift the UVs of every copy by a random amount (U, V)")
+
     show_expanded: BoolProperty(name="Show Options", default=False)
 
 

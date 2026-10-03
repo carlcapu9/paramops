@@ -369,6 +369,10 @@ class _Layout:
             else:
                 before, after = slot.extents(None)
                 anchors.append(_Anchor(pos, before, after, None, None, "marker"))
+        marker_pos = [an.pos for an in anchors if an.role == "marker"]
+        if marker_pos:
+            anchors = [an for an in anchors if an.role != "corner"
+                       or all(abs(an.pos - m) > 1e-6 for m in marker_pos)]
         anchors.sort(key=lambda an: an.pos)
         return anchors
 
@@ -448,7 +452,9 @@ class _Layout:
         edges = [g0] + cuts + [g1]
         for p0, p1 in zip(edges, edges[1:]):
             sid = self.id_at((p0 + p1) * 0.5)
-            slot = self.slot("default") if sid < 0 else self.slot("seg:%d" % sid)
+            seg = self.slots.get("seg:%d" % sid) if sid >= 0 else None
+            # Enabled IDs without geometry leave a hole; disabled IDs use the Default sample.
+            slot = seg if seg is not None and seg.active else self.slot("default")
             self.fill_gap(p0, p1, slot)
 
     def fill_gap(self, g0, g1, slot):

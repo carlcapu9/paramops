@@ -15,7 +15,7 @@ if ROOT not in sys.path:
 
 import paramops  # noqa: E402
 from paramops import handlers, ops  # noqa: E402
-from paramops.demo import box, merge, tube_x  # noqa: E402
+from paramops.demo import box, tube_x  # noqa: E402
 from paramops.writer import write  # noqa: E402
 from paramops.core.meshdata import assemble  # noqa: E402
 
@@ -376,3 +376,86 @@ def test_tube_bends_smoothly_around_round_corner():
     on_arc = (co[:, 0] > 3.0 + 1e-3) & (co[:, 1] < 1.0 - 1e-3)
     d = np.hypot(np.linalg.norm(co[on_arc, :2] - centre, axis=1) - 1.0, co[on_arc, 2] - 1.0)
     assert np.allclose(d, 0.05, atol=2e-3)
+
+
+def test_random_uv_offsets_per_module():
+    curve = poly_curve("C", [(0, 0, 0), (6, 0, 0)])
+    smp = mesh_object("Panel", panel())
+    smp.data.uv_layers.new(name="UVMap")
+    sc = scatter(curve, smp)
+    sc.paramops.default.random_uv = (0.5, 0.0)
+    me = sc.data
+    uvs = np.empty(len(me.loops) * 2, np.float32)
+    me.uv_layers["UVMap"].data.foreach_get("uv", uvs)
+    per_module = uvs.reshape(3, -1, 2)[:, :, 0].mean(axis=1)
+    assert len(set(np.round(per_module, 4))) == 3
+
+
+def test_seams_and_custom_edge_data_survive():
+    curve = poly_curve("C", [(0, 0, 0), (4, 0, 0)])
+    smp = mesh_object("Panel", panel(1.0, nx=2))
+    smp.data.edges[0].use_seam = True
+    smp.data.edges[1].use_seam = True
+    sc = scatter(curve, smp)
+    seams = [e.use_seam for e in sc.data.edges]
+    assert sum(seams) == 2 * sc.paramops.stat_modules
+    assert not sc.data.validate()
+
+
+def test_cyclic_segment_ids_and_reverse():
+    curve = poly_curve("C", [(0, 0, 0), (4, 0, 0), (4, 4, 0), (0, 4, 0)], cyclic=True)
+    smp = mesh_object("Panel", panel(1.0, nx=2))
+    alt = mesh_object("Alt", box(0.0, 0.5, -0.05, 0.05, 0.0, 2.0))
+    sc = scatter(curve, smp)
+    st = sc.paramops
+    item = st.segment_ids.add()
+    item.slot.object = alt
+    for idx in (3,):  # closing segment (0, 4) -> (0, 0)
+        ref = item.refs.add()
+        ref.spline, ref.index = 0, idx
+        ref.co_a = curve.data.splines[0].points[idx].co[:3]
+        ref.co_b = curve.data.splines[0].points[0].co[:3]
+    handlers.rebuild(sc)
+    co = coords(sc)
+    tall = co[co[:, 2] > 1.5]
+    assert np.allclose(tall[:, 0], 0.0, atol=0.06)  # only the x == 0 side uses the alternative
+    assert len(tall) > 0
+    st.reverse = True
+    co = coords(sc)
+    tall = co[co[:, 2] > 1.5]
+    assert np.allclose(tall[:, 0], 0.0, atol=0.06) and len(tall) > 0
+
+
+def test_reverse_swaps_start_and_end_and_percent_trim():
+    curve = poly_curve("C", [(0, 0, 0), (10, 0, 0)])
+    sc = scatter(curve, mesh_object("Panel", panel(1.0, nx=2)))
+    st = sc.paramops
+    st.start.object = mesh_object("Cap", box(0.0, 0.2, -0.3, 0.3, 0.0, 3.0))
+    co = coords(sc)
+    assert co[co[:, 2] > 2.0][:, 0].max() == pytest.approx(0.2, abs=1e-4)
+    st.reverse = True
+    co = coords(sc)
+    assert co[co[:, 2] > 2.0][:, 0].min() == pytest.approx(9.8, abs=1e-4)
+    st.reverse = False
+    st.clip_mode = "PERCENT"
+    st.clip_start_pct = 10.0
+    st.clip_end_pct = 20.0
+    co = coords(sc)
+    assert co[:, 0].min() == pytest.approx(1.0, abs=1e-4)
+    assert co[:, 0].max() == pytest.approx(8.0, abs=1e-4)
+
+
+def test_linked_duplicate_gets_its_own_mesh():
+    c1 = poly_curve("C1", [(0, 0, 0), (4, 0, 0)])
+    c2 = poly_curve("C2", [(0, 5, 0), (8, 5, 0)])
+    smp = mesh_object("Panel", panel(1.0))
+    a = scatter(c1, smp)
+    b = bpy.data.objects.new("B", a.data)
+    bpy.context.scene.collection.objects.link(b)
+    b.paramops.is_scatter = True
+    b.paramops.path = c2
+    b.paramops.default.object = smp
+    handlers.rebuild(b)
+    assert a.data != b.data
+    assert a.paramops.stat_modules == 4 and b.paramops.stat_modules == 8
+    assert len(a.data.vertices) == 4 * len(smp.data.vertices)

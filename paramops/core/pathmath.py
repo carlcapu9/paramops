@@ -595,39 +595,41 @@ def _insert_miter_zones(P, u, tilt, cyclic, extent):
         return P, u, tilt
     seg = P[1:] - P[:-1]
     seglen = np.maximum(_norm(seg), 1e-12)
-    S = np.concatenate(([0.0], np.cumsum(seglen)))
     T = seg / seglen[:, None]
+    if cyclic:
+        verts = np.arange(0, n - 1)
+        j_in = np.where(verts == 0, n - 2, verts - 1)
+    else:
+        verts = np.arange(1, n - 1)
+        j_in = verts - 1
+    j_out = verts
+    a, b = T[j_in], T[j_out]
+    theta = np.arccos(np.clip(np.einsum("ij,ij->i", a, b), -1.0, 1.0))
+    ah, bh = a.copy(), b.copy()
+    ah[:, 2] = 0.0
+    bh[:, 2] = 0.0
+    ah, ok_a = _normalize(ah)
+    bh, ok_b = _normalize(bh)
+    theta_h = np.where(ok_a & ok_b, np.arccos(np.clip(np.einsum("ij,ij->i", ah, bh), -1.0, 1.0)), 0.0)
+    th = np.maximum(theta, theta_h)
+    sharp = th >= math.radians(2.0)
+    Z = np.maximum(4.0 * extent * np.tan(np.minimum(th, math.radians(170.0)) * 0.5), 1e-4)
     extra = []
-    verts = range(n) if cyclic else range(1, n - 1)
-    for i in verts:
-        if cyclic and i == n - 1:
-            continue
-        if i == 0:
-            if not cyclic:
-                continue
-            j_in, j_out = n - 2, 0
-        else:
-            j_in, j_out = i - 1, i
-        a, b = T[j_in], T[j_out]
-        ah, bh = a.copy(), b.copy()
-        ah[2] = bh[2] = 0.0
-        theta = max(_angle(a, b), _angle(ah, bh))
-        if theta < math.radians(2.0):
-            continue
-        Z = 4.0 * extent * math.tan(min(theta, math.radians(170.0)) * 0.5)
-        Z = max(Z, 1e-4)
-        if Z < 0.45 * seglen[j_in]:
-            extra.append((j_in, 1.0 - Z / seglen[j_in]))
-        if Z < 0.45 * seglen[j_out]:
-            extra.append((j_out, Z / seglen[j_out]))
+    for jin, jout, z in zip(j_in[sharp], j_out[sharp], Z[sharp]):
+        if z < 0.45 * seglen[jin]:
+            extra.append((int(jin), 1.0 - z / seglen[jin]))
+        if z < 0.45 * seglen[jout]:
+            extra.append((int(jout), z / seglen[jout]))
     if not extra:
         return P, u, tilt
-    keys = [float(j) for j in range(n)] + [j + f for j, f in extra]
-    pts = [P[j] for j in range(n)] + [P[j] + seg[j] * f for j, f in extra]
-    us = [u[j] for j in range(n)] + [u[j] + (u[j + 1] - u[j]) * f for j, f in extra]
-    ts = [tilt[j] for j in range(n)] + [tilt[j] + (tilt[j + 1] - tilt[j]) * f for j, f in extra]
-    order = np.argsort(np.asarray(keys), kind="stable")
-    return (np.asarray(pts)[order], np.asarray(us)[order], np.asarray(ts)[order])
+    ej = np.array([j for j, _ in extra], dtype=np.int64)
+    ef = np.array([f for _, f in extra], dtype=np.float64)
+    keys = np.concatenate([np.arange(n, dtype=np.float64), ej + ef])
+    pts = np.vstack([P, P[ej] + seg[ej] * ef[:, None]])
+    us = np.concatenate([u, u[ej] + (u[ej + 1] - u[ej]) * ef])
+    ts = np.concatenate([tilt, tilt[ej] + (tilt[ej + 1] - tilt[ej]) * ef])
+    order = np.argsort(keys, kind="stable")
+    return pts[order], us[order], ts[order]
 
 
 class Path:

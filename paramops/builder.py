@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Builds the scatter mesh of one scatter object."""
 
-import math
 import re
 import time
 import traceback
@@ -15,7 +14,7 @@ from . import curves, samples, writer
 from .core import pathmath as pm
 from .core.layout import LayoutSettings, PathInfo, SlotInfo, VariantInfo, layout_path
 from .core.meshdata import MeshData, assemble, merge
-from .core.placement import SlotConfig, place_group
+from .core.placement import SlotConfig, euler_matrix, place_group, random_uv_offsets
 from .props import iter_slots, slot_objects
 
 POINT_SLOTS = {"evenly", "corner"}
@@ -49,8 +48,7 @@ def _static_matrix(slot):
         sx = -sx
     if slot.mirror_y:
         sy = -sy
-    from .core.placement import _euler_matrix
-    return _euler_matrix(rx, ry, rz) @ np.diag((sx, sy, sz))
+    return euler_matrix(rx, ry, rz) @ np.diag((sx, sy, sz))
 
 
 def resolve_slot(key, slot, st, depsgraph):
@@ -92,7 +90,8 @@ def resolve_slot(key, slot, st, depsgraph):
         offset=(off[0], off[1] + st.offset_y, off[2] + st.offset_z),
         random_offset=tuple(slot.random_offset), random_rotation=tuple(slot.random_rotation),
         random_scale=slot.random_scale, random_flip_x=slot.random_flip_x,
-        random_flip_y=slot.random_flip_y, flat_top=slot.flat_top, flat_bottom=slot.flat_bottom,
+        random_flip_y=slot.random_flip_y, random_uv=tuple(slot.random_uv),
+        flat_top=slot.flat_top, flat_bottom=slot.flat_bottom,
         flat_center=slot.flat_center, flat_reference=slot.flat_reference, orient=slot.orient,
         seed=slot.seed)
     return ResolvedSlot(info, cfg, variants)
@@ -213,6 +212,8 @@ def build(obj, depsgraph=None):
             groups, n_modules, truncated = [], 0, False
             st.last_error = str(exc)
         asm = assemble(groups)
+        if obj.data.users > 1 and not obj.data.library:
+            obj.data = obj.data.copy()  # linked duplicates must not overwrite each other
         writer.write(obj.data, asm)
         st.stat_modules = n_modules
         st.stat_verts = len(asm.co)
@@ -331,6 +332,8 @@ def _compute(obj, depsgraph):
 
     seg_ids = {}
     for j, item in enumerate(st.segment_ids):
+        if not item.slot.enabled:
+            continue  # a disabled ID falls back to the Default sample
         for ref in item.refs:
             seg_ids.setdefault(ref.spline, {})[ref.index] = j
     point_markers = {}
@@ -395,7 +398,7 @@ def _compute(obj, depsgraph):
             if md.nv == 0:
                 continue
             pos, flips = place_group(path, md, plist, rs.cfg, st.seed, si, inv, ref_bbox)
-            groups.append((md, pos, flips))
+            groups.append((md, pos, flips, random_uv_offsets(rs.cfg, plist, st.seed, si)))
         if n_modules >= st.max_modules:
             truncated = True
             break

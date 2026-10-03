@@ -39,35 +39,64 @@ def attr_value_key(data_type):
     return _VALUE_KEY[data_type]
 
 
+def _get_attr(me, name, key, out, fallback):
+    attr = me.attributes.get(name)
+    if attr is not None and len(attr.data) * (out.size // max(len(attr.data), 1)) == out.size:
+        try:
+            attr.data.foreach_get(key, out)
+            return out
+        except (RuntimeError, TypeError):
+            pass
+    fallback(out)
+    return out
+
+
+SEAM_NAMES = ("uv_seam", ".uv_seam")
+
+
 def mesh_to_data(me, materials=None):
-    """Convert a ``bpy.types.Mesh`` into :class:`MeshData`."""
+    """Convert a ``bpy.types.Mesh`` into :class:`MeshData` (fast attribute reads)."""
     nv, ne, nl, nf = len(me.vertices), len(me.edges), len(me.loops), len(me.polygons)
     co = np.empty(nv * 3, np.float32)
-    me.vertices.foreach_get("co", co)
+    if nv:
+        _get_attr(me, "position", "vector", co, lambda o: me.vertices.foreach_get("co", o))
     edges = np.empty(ne * 2, np.int32)
-    me.edges.foreach_get("vertices", edges)
+    if ne:
+        _get_attr(me, ".edge_verts", "value", edges, lambda o: me.edges.foreach_get("vertices", o))
     lv = np.empty(nl, np.int32)
-    me.loops.foreach_get("vertex_index", lv)
     le = np.empty(nl, np.int32)
-    me.loops.foreach_get("edge_index", le)
+    if nl:
+        _get_attr(me, ".corner_vert", "value", lv, lambda o: me.loops.foreach_get("vertex_index", o))
+        _get_attr(me, ".corner_edge", "value", le, lambda o: me.loops.foreach_get("edge_index", o))
     fs = np.empty(nf, np.int32)
-    me.polygons.foreach_get("loop_start", fs)
-    fz = np.empty(nf, np.int32)
-    me.polygons.foreach_get("loop_total", fz)
-    mi = np.empty(nf, np.int32)
-    me.polygons.foreach_get("material_index", mi)
+    if nf:
+        me.polygons.foreach_get("loop_start", fs)
+    fz = np.diff(np.append(fs, nl)).astype(np.int32) if nf else np.empty(0, np.int32)
+    if nf and (fz <= 0).any():
+        me.polygons.foreach_get("loop_total", fz)
+    mi = np.zeros(nf, np.int32)
+    if nf and me.attributes.get("material_index") is not None:
+        _get_attr(me, "material_index", "value", mi, lambda o: me.polygons.foreach_get("material_index", o))
 
     uvs = []
     uv_names = set()
     for uv in me.uv_layers:
         arr = np.empty(nl * 2, np.float32)
-        uv.data.foreach_get("uv", arr)
+        if nl:
+            _get_attr(me, uv.name, "vector", arr, lambda o, lay=uv: lay.data.foreach_get("uv", o))
         uvs.append((uv.name, arr.reshape(-1, 2)))
         uv_names.add(uv.name)
 
     attrs = {}
+    seams = None
     for at in me.attributes:
         name = at.name
+        if name in SEAM_NAMES and at.domain == "EDGE" and ne:
+            s = np.empty(ne, bool)
+            at.data.foreach_get("value", s)
+            if s.any():
+                seams = s
+            continue
         if name.startswith(".") or name in {"position", "material_index"} or name in uv_names:
             continue
         dt, dom = at.data_type, at.domain
@@ -81,13 +110,6 @@ def mesh_to_data(me, materials=None):
         except (TypeError, RuntimeError, AttributeError):
             continue
         attrs[name] = (dom, dt, arr.reshape(-1, comps) if comps > 1 else arr)
-
-    seams = None
-    if ne:
-        s = np.empty(ne, bool)
-        me.edges.foreach_get("use_seam", s)
-        if s.any():
-            seams = s
     return MeshData(co.reshape(-1, 3), lv, le, fs, fz, edges.reshape(-1, 2), mat_index=mi,
                     materials=materials or [None], uvs=uvs, attrs=attrs, seams=seams)
 
