@@ -289,6 +289,7 @@ TEMPLATE_ITEMS = [
     ("WALL", "Wall with Windows", "Conditional windows, corner pillars and a door marker"),
     ("KERB", "Random Kerb", "Random stones with random materials and rotations"),
     ("PATTERN", "Sequence Pattern", "Sequence with counts and empty gaps"),
+    ("GARDEN", "Garden Border (Segment IDs)", "Hedge, picket fence and low wall chosen per curve segment"),
 ]
 
 

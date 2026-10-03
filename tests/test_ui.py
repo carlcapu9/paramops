@@ -108,7 +108,7 @@ def test_panels_draw(active, mode):
     tree.nodes.active = next(n for n in tree.nodes if n.bl_idname == "CF_NodeLinear")
     space = SimpleNamespace(tree_type=nodes.TREE_ID, node_tree=tree)
     ctx = SimpleNamespace(active_object=target, object=target, mode=mode, scene=bpy.context.scene,
-                          space_data=space)
+                          space_data=space, window_manager=bpy.context.window_manager)
     drawn = 0
     for cls in ui.classes:
         if hasattr(cls, "poll") and not cls.poll(ctx):
@@ -125,3 +125,17 @@ def test_context_output_from_curve():
     curve = next(n.curve for n in obj.cf_scatter.style.nodes if n.bl_idname == "CF_NodeSpline")
     assert ops.context_output(SimpleNamespace(active_object=curve)) == obj
     assert ops.context_output(SimpleNamespace(active_object=obj)) == obj
+
+
+def test_overlay_midpoints():
+    from curveforge import overlay
+    bpy.ops.curveforge.add_template(template="GARDEN")
+    obj = bpy.context.active_object
+    curve = next(n.curve for n in obj.cf_scatter.style.nodes if n.bl_idname == "CF_NodeSpline")
+    mids = list(overlay.midpoints(curve))
+    assert len(mids) == 4
+    ids = {(r.spline, r.index): r.value for r in curve.cf_curve.ids}
+    assert sorted(ids.values()) == [1, 2]
+    origin = curve.matrix_world.translation
+    assert (mids[0][2] - origin - __import__("mathutils").Vector((3.0, 0.0, 0.0))).length < 1e-4
+    overlay.draw()  # no 3D view region in background mode: nothing to draw, no error

@@ -100,6 +100,7 @@ class CF_PT_segment_ids(Panel):
         layout = self.layout
         curve = context.active_object
         data = curve.cf_curve
+        layout.prop(context.window_manager, "cf_show_ids")
         layout.label(text="Select consecutive points, then:")
         row = layout.row(align=True)
         row.prop(data, "edit_value", text="ID")

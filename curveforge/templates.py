@@ -6,7 +6,7 @@ import math
 import bpy
 import numpy as np
 
-from . import live, meshio
+from . import curvedata, live, meshio
 from .engine.mesh import Assembler, MeshBuf, merge
 from .nodes import TREE_ID
 from .ops import add_node, link, new_output
@@ -52,6 +52,9 @@ def tube_x(x0, x1, radius, y=0.0, z=0.0, segs=12, rings=6, mat=None):
     sharp = np.zeros(buf.n_faces, dtype=bool)
     sharp[-2:] = True
     buf.attrs["sharp_face"] = ("FACE", "BOOLEAN", sharp)
+    # Sharp cap outlines, otherwise the smooth sides blend with the flat caps.
+    last = rings * segs
+    buf.attrs["sharp_edge"] = ("EDGE", "BOOLEAN", (buf.edges < segs).all(axis=1) | (buf.edges >= last).all(axis=1))
     return buf
 
 
@@ -284,7 +287,7 @@ def kerb(env):
         mat = add_node(t, "CF_NodeMaterial", (-320, 40), pick="RANDOM", count=3, seed=5,
                        material_0=mats[0], material_1=mats[1], material_2=mats[2])
         link(t, xf, "Segment", mat, "Segment")
-        rnd = add_node(t, "CF_NodeRandom", (-560, -240), seed=1)
+        rnd = add_node(t, "CF_NodeRandom", (-800, -180), seed=1)
         rnd.inputs["Min"].default_value = 0.004
         rnd.inputs["Max"].default_value = 0.02
         gen = add_node(t, "CF_NodeLinear", (-40, 200), upright=True)
@@ -328,8 +331,45 @@ def pattern(env):
     return t
 
 
+def garden(env):
+    leaf = _material("CF Hedge", (0.1, 0.28, 0.08), 0.0, 0.9)
+    paint = _material("CF Picket", (0.92, 0.9, 0.84), 0.0, 0.5)
+    stone = _material("CF Stone Wall", (0.52, 0.48, 0.42), 0.0, 0.85)
+    hedge = env.sample("Hedge", merge([box(0.0, 1.0, -0.32, 0.32, 0.0, 0.9, nx=4, mat=leaf),
+                                       box(0.0, 1.0, -0.27, 0.27, 0.9, 1.0, nx=4, mat=leaf)]))
+    parts = [box(0.0, 1.0, -0.03, 0.0, 0.22, 0.3, nx=4, mat=paint),
+             box(0.0, 1.0, -0.03, 0.0, 0.72, 0.8, nx=4, mat=paint)]
+    parts += [box(x - 0.04, x + 0.04, 0.0, 0.025, 0.04, 1.0, mat=paint) for x in (0.1, 0.3, 0.5, 0.7, 0.9)]
+    picket = env.sample("Picket Fence", merge(parts))
+    wall = env.sample("Low Wall", merge([box(0.0, 1.0, -0.2, 0.2, 0.0, 0.55, nx=4, mat=stone),
+                                         box(0.0, 1.0, -0.25, 0.25, 0.55, 0.65, nx=4, mat=stone)]))
+    post = env.sample("Post", box(-0.1, 0.1, -0.1, 0.1, 0.0, 1.15, mat=stone))
+    curve = env.curve([(0, 0, 0), (6, 0, 0), (6, 5, 0), (0, 5, 0), (0, 1.5, 0)])
+    curvedata.set_ids(curve, [(0, 1)], 1)
+    curvedata.set_ids(curve, [(0, 2)], 2)
+    t = env.tree()
+    with live.suspended():
+        spl = add_node(t, "CF_NodeSpline", (-760, 320), curve=curve)
+        n_hedge = add_node(t, "CF_NodeSegment", (-760, 120), label="Hedge (ID 0)", object=hedge, align_z="MIN")
+        n_picket = add_node(t, "CF_NodeSegment", (-760, -80), label="Picket Fence (ID 1)", object=picket,
+                            align_z="MIN")
+        n_wall = add_node(t, "CF_NodeSegment", (-760, -280), label="Low Wall (ID 2)", object=wall, align_z="MIN")
+        sel = add_node(t, "CF_NodeSelector", (-460, 40), variable="segment_id", mode="CLAMP")
+        for i, node in enumerate((n_hedge, n_picket, n_wall)):
+            link(t, node, "Segment", sel, str(i))
+            sel.cf_sync_inputs()
+        n_post = add_node(t, "CF_NodeSegment", (-460, -240), label="Post", object=post, align_z="MIN",
+                          bend="OFF", instance="ON")
+        gen = add_node(t, "CF_NodeLinear", (-60, 220), cf_panel=True)
+        link(t, spl, "Spline", gen, "Spline")
+        link(t, sel, "Segment", gen, "Default")
+        for name in ("Start", "End", "Corner"):
+            link(t, n_post, "Segment", gen, name)
+    return t
+
+
 BUILDERS = {"FENCE": ("Fence", fence), "RAILING": ("Railing", railing), "WALL": ("Wall", wall),
-            "KERB": ("Kerb", kerb), "PATTERN": ("Pattern", pattern)}
+            "KERB": ("Kerb", kerb), "PATTERN": ("Pattern", pattern), "GARDEN": ("Garden", garden)}
 
 
 def build(context, key, origin=(0.0, 0.0, 0.0)):

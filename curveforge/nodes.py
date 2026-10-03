@@ -44,7 +44,7 @@ class CF_StyleTree(NodeTree):
 TRI_STATE = [("DEFAULT", "Default", "Use the setting of the generator"),
              ("ON", "On", "Always on for this segment"),
              ("OFF", "Off", "Always off for this segment")]
-VARIABLE_ITEMS = [(name, name.replace("_", " ").title(), desc) for name, desc in VARIABLES]
+VARIABLE_ITEMS = [(name, name.replace("_", " ").title().replace(" Id", " ID"), desc) for name, desc in VARIABLES]
 COMPARE_ITEMS = [
     ("EQUAL", "Equal", "Variable == Value"), ("NOT_EQUAL", "Not Equal", "Variable != Value"),
     ("LESS", "Less Than", "Variable < Value"), ("LESS_EQUAL", "Less or Equal", "Variable <= Value"),

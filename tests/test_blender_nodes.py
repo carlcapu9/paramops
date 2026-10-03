@@ -392,3 +392,23 @@ def test_instancing_rigid_segments():
     n_post.instance = "OFF"
     assert obj.modifiers.get("CurveForge Instances") is None
     assert coords(obj)[:, 2].max() == pytest.approx(1.5)
+
+
+def test_garden_segment_ids_pick_segments_per_curve_segment():
+    bpy.ops.curveforge.add_template(template="GARDEN")
+    obj = bpy.context.active_object
+    me = obj.data
+    names = [m.name if m else "" for m in me.materials]
+    centers = {}
+    for poly in me.polygons:
+        centers.setdefault(names[poly.material_index], []).append(tuple(obj.matrix_world @ poly.center))
+    origin = obj.matrix_world.translation
+    hedge = np.array(centers["CF Hedge"]) - origin
+    picket = np.array(centers["CF Picket"]) - origin
+    wall = np.array(centers["CF Stone Wall"]) - origin
+    # ID 1 = second segment (x = 6), ID 2 = third segment (y = 5), ID 0 elsewhere.
+    assert np.all(np.abs(picket[:, 0] - 6.0) < 0.1)
+    assert np.all(np.abs(wall[:, 1] - 5.0) < 0.3)
+    assert np.all((np.abs(hedge[:, 1]) < 0.4) | (np.abs(hedge[:, 0]) < 0.4))
+    # The posts are instances.
+    assert obj.modifiers.get("CurveForge Instances") is not None
