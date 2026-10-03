@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "curveforge"
+version = "1.0.0"
+name = "CurveForge"
+tagline = "Node-based modular scattering along curves"
+maintainer = "CurveForge"
+type = "add-on"
+
+tags = ["Modeling", "Node", "Object"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
