@@ -266,9 +266,9 @@ def surface_nets(field, iso, origin, h, pad_value=None) -> tuple:
     mean of the edge crossings (linear interpolation) of its patch of the dual cube;
     see the module docstring for the treatment of ambiguous configurations: the
     mesh is a closed 2-manifold for any input. NaN samples count as outside.
-    With ``pad_value >= iso`` the border counts as inside and the faces that would
-    close the surface at the grid border are omitted (open surface). Empty result:
-    ``(zeros((0, 3)), zeros((0, 4), int64))``.
+    With ``pad_value >= iso`` the border counts as inside: the surface then encloses
+    the outside cells (still closed, normals still towards ``field < iso``). Empty
+    result: ``(zeros((0, 3)), zeros((0, 4), int64))``.
     """
     verts, quads, _info = _surface_nets(field, iso, origin, h, pad_value)
     return verts, quads
@@ -435,7 +435,7 @@ def _surface_nets(field, iso, origin, h, pad_value=None) -> tuple:
         quads.append(quad[valid])
     quads = np.concatenate(quads) if quads else np.zeros((0, 4), dtype=np.int64)
 
-    # ---- compact (vertices can only be unused when the border counts as inside)
+    # ---- compact (defensive: with the uniform padding layer every quad is complete)
     if quads.shape[0] == 0:
         return (*_empty_mesh(), info)
     used = np.zeros(n_verts, dtype=bool)

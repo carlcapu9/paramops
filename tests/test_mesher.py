@@ -181,18 +181,18 @@ def test_iso_exactly_on_samples_and_nan():
     assert signed_volume(verts, quads) > 0.0
 
 
-def test_inside_padding_gives_open_surface():
+def test_inside_padding_encloses_the_outside_cells():
     field = np.zeros((6, 6, 6))
     field[:3] = 1.0
     verts, quads = mesher.surface_nets(field, 0.5, (0, 0, 0), 1.0, pad_value=1.0)
-    assert quads.shape[0] > 0
-    assert quads.min() >= 0 and quads.max() < verts.shape[0]
-    assert np.array_equal(np.unique(quads), np.arange(verts.shape[0]))
-    undirected, directed = edge_face_counts(quads)
-    assert np.all(directed == 1) and set(np.unique(undirected)) <= {1, 2}
-    assert np.any(undirected == 1)  # open at the border
-    # The surface separates x < 3 (inside, with the padding) from x >= 3 (outside).
-    assert np.allclose(verts[:, 0], 3.0)
+    assert_closed_manifold(verts, quads)
+    # The outside block x in [3, 6] is now a cavity: normals point into it.
+    assert np.allclose(verts.min(axis=0), (3.0, 0.0, 0.0))
+    assert np.allclose(verts.max(axis=0), (6.0, 6.0, 6.0))
+    assert -3 * 6 * 6 < signed_volume(verts, quads) < -0.85 * 3 * 6 * 6
+    verts, quads = mesher.surface_nets(field, 0.5, (0, 0, 0), 1.0, pad_value=0.5)
+    assert_closed_manifold(verts, quads)
+    assert signed_volume(verts, quads) < 0.0
 
 
 def touching_blobs(offset, direction, gap, n=26):

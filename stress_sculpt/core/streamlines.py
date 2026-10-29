@@ -75,7 +75,6 @@ _CLOSE_ALIGN = 0.7  # a closing head must see the other head ahead (within ~45 d
 _SNAP_RADIUS = 2.0  # explicit seeds outside the solid move to a solid centre this close
 _BATCH_SEEDS = 128  # candidate lines integrated together in one round
 _SCAN_FACTOR = 4  # seeds tested for admissibility per round, in units of the batch size
-_STAMP_CELL = 0.8  # visit-stamp cell size, in units of the separation
 _MAX_STAMP_CELLS = 1 << 22
 _EIG_CHUNK = 1 << 18  # elements per chunk when analysing the whole field
 
@@ -427,8 +426,8 @@ class _Batch:
         self.dirn = np.concatenate([vec0, -vec0]).astype(np.float64)
         self.max_points = int(max_points)
         cap = min(self.max_points, 128)
-        self.trail_u = np.empty((n, cap, 3), dtype=np.float64)
-        self.trail_v = np.empty((n, cap), dtype=np.float64)
+        self.trail_u = np.zeros((n, cap, 3), dtype=np.float64)
+        self.trail_v = np.zeros((n, cap), dtype=np.float64)
         self.trail_u[:, 0] = self.pos
         self.trail_v[:, 0] = np.concatenate([self.val0, self.val0])
         self.n_pts = np.ones(n, dtype=np.int64)
@@ -442,8 +441,8 @@ class _Batch:
             return
         new_cap = min(self.max_points, max(needed, 2 * cap))
         n = len(self.pos)
-        trail_u = np.empty((n, new_cap, 3), dtype=np.float64)
-        trail_v = np.empty((n, new_cap), dtype=np.float64)
+        trail_u = np.zeros((n, new_cap, 3), dtype=np.float64)
+        trail_v = np.zeros((n, new_cap), dtype=np.float64)
         trail_u[:, :cap] = self.trail_u
         trail_v[:, :cap] = self.trail_v
         self.trail_u, self.trail_v = trail_u, trail_v
@@ -531,24 +530,30 @@ class _Tracer:
         self.max_degenerate = max(1, int(math.ceil(_DEGENERATE_LENGTH / s)))
 
     def _init_stamps(self) -> None:
-        """Visit stamps: coarse cells remember the last half-line (and time) inside them.
+        """Visit stamps: cells (>= ``separation``) remember the last half-line inside them.
 
-        A half re-entering a cell it left ``lag_coil`` or more steps earlier, or ending
-        closer than ``separation`` to where it was ``lag_coil`` steps ago, is curling
-        onto itself: it stops early (the exact self-clipping happens at acceptance).
+        They detect cheaply when a half may be coming back near its own line (see
+        :meth:`_self_approach`). Stamps are only a filter: an exact distance test
+        decides, so a stamp overwritten by another line merely delays the stop (the
+        exact self-clipping at acceptance stays authoritative).
         """
-        cell = _STAMP_CELL * self.sep
-        dims = np.ceil(self.shape / cell).astype(np.int64) + 1
+        cell = self.sep
+        dims = np.ceil(self.shape / cell).astype(np.int64) + 2  # + one margin cell per side
         while int(np.prod(dims)) > _MAX_STAMP_CELLS:
             cell *= 1.25
-            dims = np.ceil(self.shape / cell).astype(np.int64) + 1
+            dims = np.ceil(self.shape / cell).astype(np.int64) + 2
         self.stamp_cell = cell
+        mult = np.array([dims[1] * dims[2], dims[2], 1], dtype=np.int64)
+        self.stamp_mult = mult
         self.stamp_dims = dims
-        self.stamp_mult = np.array([dims[1] * dims[2], dims[2], 1], dtype=np.int64)
+        self.stamp_nb = np.array(
+            [dx * mult[0] + dy * mult[1] + dz for dx in (-1, 0, 1) for dy in (-1, 0, 1)
+             for dz in (-1, 0, 1)],
+            dtype=np.int64,
+        )
         n = int(np.prod(dims))
         self.stamp_uid = np.full(n, -1, dtype=np.int64)
         self.stamp_time = np.zeros(n, dtype=np.int64)
-        self.lag_coil = max(2, int(math.ceil(2.0 * math.sqrt(3.0) * cell / self.s)))
 
     # -------------------------------------------------------------- driver
     def run(self) -> list:
@@ -787,7 +792,7 @@ class _Tracer:
                     if m.any():
                         stop[m] = self.index[f].near(x_new[m], sep)
             t_new = b.n_pts[ia]
-            stop |= self._curling(b, ia, x_new, t_new, ~stop)
+            stop |= self._self_approach(b, ia, x_new, t_new, ~stop)
 
             rec = ~stop
             ir = ia[rec]
@@ -803,37 +808,58 @@ class _Tracer:
                 self._close_loops(b, ir)
                 b.alive[ir[b.n_pts[ir] > self.max_steps]] = False
 
-    def _curling(self, b: _Batch, ia, x_new, t_new, candidates) -> np.ndarray:
-        """Halves curling onto their line (coarse, cheap safeguard; see ``_init_stamps``).
+    def _self_approach(self, b: _Batch, ia, x_new, t_new, candidates) -> np.ndarray:
+        """Halves whose new point comes closer than ``separation`` to their own line.
 
-        A cell last visited by the same half ``lag_coil`` steps ago or more, or by the
-        other half of the same line at a point that half left ``lag_coil`` steps ago or
-        more (its trail, not the region around its head where loops close), counts as
-        a self-approach; so does a chord over the last ``lag_coil`` steps shorter than
-        ``separation``.
+        Counted are the points of the same half at least ``lag_self`` steps back, and
+        the points of the other half that it left at least ``lag_self`` steps ago (its
+        trail, not the region around its head, where closing loops meet). Candidates
+        are filtered first (old stamps of either half in the 27 surrounding cells, or a
+        chord over the last ``lag_self`` steps shorter than ``separation``), then
+        tested exactly against the stored trails.
         """
-        curl = np.zeros(ia.size, dtype=bool)
+        found = np.zeros(ia.size, dtype=bool)
         if not candidates.any():
-            return curl
-        back = t_new - self.lag_coil
-        m = candidates & (back >= 0)
-        if m.any():
-            chord = x_new[m] - b.trail_u[ia[m], back[m]]
-            curl[m] = np.einsum("ij,ij->i", chord, chord) < self.sep * self.sep
-        c = np.floor(x_new / self.stamp_cell).astype(np.int64)
-        np.clip(c, 0, self.stamp_dims - 1, out=c)
-        cells = c @ self.stamp_mult
+            return found
+        lag = self.lag_self
         uid = b.uid[ia]
         partner = b.partner[ia]
-        owner = self.stamp_uid[cells]
-        stamped = self.stamp_time[cells]
-        own = (owner == uid) & (t_new - stamped >= self.lag_coil)
-        other = (owner == b.uid[partner]) & (b.n_pts[partner] - 1 - stamped >= self.lag_coil)
-        curl |= candidates & (own | other)
-        w = candidates & ~curl
-        self.stamp_uid[cells[w]] = uid[w]
-        self.stamp_time[cells[w]] = t_new[w]
-        return curl
+        n_partner = b.n_pts[partner]
+        c = np.floor(x_new / self.stamp_cell).astype(np.int64) + 1
+        np.clip(c, 1, self.stamp_dims - 2, out=c)
+        cell = c @ self.stamp_mult
+        around = cell[:, None] + self.stamp_nb[None, :]
+        owner = self.stamp_uid[around]
+        age = self.stamp_time[around]
+        flag = (owner == uid[:, None]) & (t_new[:, None] - age >= lag)
+        flag |= (owner == b.uid[partner][:, None]) & ((n_partner - 1)[:, None] - age >= lag)
+        flag = flag.any(axis=1)
+        back = t_new - lag
+        m = candidates & ~flag & (back >= 0)
+        if m.any():
+            chord = x_new[m] - b.trail_u[ia[m], back[m]]
+            flag[m] = np.einsum("ij,ij->i", chord, chord) < self.sep * self.sep
+        flag &= candidates
+        if flag.any():
+            fi = np.flatnonzero(flag)
+            halves, others = ia[fi], partner[fi]
+            n = int(max(b.n_pts[halves].max(), n_partner[fi].max()))
+            steps = np.arange(n)
+            r2 = self.sep * self.sep
+            x = x_new[fi][:, None, :]
+            d_own = b.trail_u[halves, :n] - x
+            hit = (np.einsum("fti,fti->ft", d_own, d_own) < r2) & (
+                steps[None, :] <= (t_new[fi] - lag)[:, None]
+            )
+            d_other = b.trail_u[others, :n] - x
+            hit |= (np.einsum("fti,fti->ft", d_other, d_other) < r2) & (
+                steps[None, :] <= (n_partner[fi] - 1 - lag)[:, None]
+            )
+            found[fi] = hit.any(axis=1)
+        w = candidates & ~found
+        self.stamp_uid[cell[w]] = uid[w]
+        self.stamp_time[cell[w]] = t_new[w]
+        return found
 
     def _close_loops(self, b: _Batch, ir: np.ndarray) -> None:
         """Stop both halves of lines whose heads meet (closed loops).
