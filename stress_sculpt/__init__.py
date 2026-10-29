@@ -41,7 +41,6 @@ _SUBMODULES = (
     "build",
     "operators",
     "ui",
-    "translations",
 )
 
 
@@ -59,9 +58,9 @@ if bpy is not None:
     if "props" in locals():
         _reload_submodules()
 
-    from . import props, jobs, operators, ui, translations  # noqa: E402
+    from . import props, jobs, operators, ui  # noqa: E402
 
-    _REGISTER_ORDER = (props, operators, ui, translations)
+    _REGISTER_ORDER = (props, operators, ui)
 
 
 def register():
