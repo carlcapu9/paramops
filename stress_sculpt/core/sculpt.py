@@ -1,4 +1,4 @@
-"""Implicit tube field of the sculpture: stress lines fused into one organic solid.
+"""Implicit tube field of the sculpture: members fused into one organic solid.
 
 Every :class:`Tube` (a polyline with a radius and a carried value per point) adds
 a smooth implicit field on a regular, element-centred grid (``origin + (ijk + 0.5)
@@ -10,44 +10,71 @@ Field of one tube
     ``r_a, r_b``::
 
         t = clamp(dot(p - a, b - a) / |b - a|^2, 0, 1)      # closest point parameter
-        d = |p - (a + t (b - a))|                             # exact capsule distance
+        d = |p - (a + t (b - a))|                             # capsule distance
         r = r_a + t (r_b - r_a)                               # radius, linear along the segment
         f = phi(T * d / r),   phi(u) = (1 - u^2)^3 for u < 1, else 0   (Wyvill kernel)
 
     with ``T = sqrt(1 - TUBE_ISO ** (1/3))`` so that ``f == TUBE_ISO`` exactly at
-    ``d == r``. A tube takes the maximum over its own segments (exact union: no
-    bulges at the joints of the polyline). The kernel reaches zero at
-    ``TUBE_SUPPORT * r`` (~2.2 r); only grid points inside each segment's bounding
-    box grown by that support are evaluated. ``TUBE_ISO = 0.5`` puts the surface
-    next to the inflection point of ``phi`` (``u^2 = 1/5``), where the field is
-    almost linear across the surface, so the linear edge interpolation of the
-    mesher is very accurate.
+    ``d == r``. The kernel reaches zero at ``TUBE_SUPPORT * r`` (~2.2 r). Each
+    segment is evaluated only inside its *slab* (between the planes through its
+    ends, perpendicular to it), extended by the full support at the ends of the
+    polyline (round caps) and, at a joint, by ``support * sin(bend / 2)`` (the full
+    support for bends over 90 degrees), just enough to cover the outer wedge of the
+    bend; a tube is the maximum of its restricted segments. On a straight run this
+    is exactly the surface of revolution of the linearly interpolated radius - no
+    beads at the joints of a tapering polyline (an unrestricted capsule union would
+    let the joint spheres poke out of the narrowing segment by up to ~7 % of the
+    radius); bends get round outer corners. (The restriction can leave steps of
+    well under 1 % of the radius on the inside of sharp bends of strongly tapering
+    tubes.) ``TUBE_ISO = 0.5`` puts the surface next to the inflection point of
+    ``phi`` (``u^2 = 1/5``), where the field is almost linear across the surface, so
+    the linear edge interpolation of the mesher is very accurate.
 
 Smooth union (``blend`` in [0, 1])
-    ::
+    Tubes meet in a soft maximum whose temperature follows the angle of the crease
+    they form, so creases get round fillets while overlapping or coaxial members
+    do not swell. Per grid point, over the tubes ``i`` that reach it::
 
-        U(f_1, ..., f_n) = tau * ln(1 + sum_i (exp(f_i / tau) - 1)),   tau = TAU_MAX * blend
+        tau = TAU_MAX * blend                              # 0: plain maximum
+        F = max_i f_i,   S = sum_i (exp(f_i / tau) - 1)    # soft-max: tau ln(1 + S)
+        theta = crease angle (angle between the tubes' field gradients)
+        tau' = tau * sin(theta) for theta < 90 deg, else tau
+        U = tau' ln(exp(F / tau') + exp(G / tau') - 1)
 
-    a soft maximum with 0 as neutral element:
+    ``G = tau ln(1 + S - exp(F / tau))`` is the soft maximum of the other tubes (the
+    second tube itself when two meet; clamped towards ``F`` as ``tau'`` vanishes),
+    and ``theta`` comes from the weighted mean of the pairwise misalignments
+    ``1 - cos(theta_ij)`` of the unit gradients, with weights that do not depend on
+    ``blend`` (exactly the angle between the two gradients when two tubes meet). The
+    gradient of a tube's field points to the closest point of its axis.
 
     * ``blend = 0`` gives the plain maximum (hard union, sharp creases),
     * a tube alone keeps its exact field for every blend: a lone tube's surface is
       always at its radius, whatever the blend,
-    * ``max_i f_i <= U <= max_i f_i + tau ln(n)``: the extra material is bounded
-      (unlike a metaball sum): at ``blend = 1`` two coincident tubes grow ~18% in
-      radius (a plain sum: +34%) and two parallel tubes do not merge into a slab,
-      while the creases where members cross get round fillets (~0.6 r),
-    * associative and commutative (``U(a, b, c) = U(U(a, b), c)``) and increasing in
-      ``blend`` point by point, so tubes are accumulated in any order and chunking,
-      and :func:`union_fields` combines whole fields with exactly the same rule.
+    * the extra material is bounded: ``F <= U <= tau ln(1 + S) <= F + tau ln(n)``;
+      at a crease of 90 degrees or more (crossings, the crotch between branches)
+      ``U`` is the full soft maximum (the old metaball-like fillet, ~0.15 r deep
+      at ``blend = 0.45`` for a right-angle crossing), while for a crease of angle
+      ``theta`` both the fillet's footprint (~``2 tau / |grad f|``, ~0.3 r at
+      ``blend = 0.45``) and its depth (``prop. to sin(theta / 2)``) behave like a
+      rolling-ball fillet: coaxial or touching-parallel overlaps (``theta = 0``) and
+      the tops of crossings get no extra material, a shallow junction gets a short,
+      shallow fillet instead of a bulge,
+    * symmetric in the tubes and independent of their order and of the chunking
+      (every per-point quantity is a sum or a maximum over tubes), continuous, and
+      non-decreasing in ``blend`` point by point.
 
-    ``value_field`` is the average of the tubes' values weighted by the same
-    soft-max weights ``exp(f_i / tau) - 1`` (the value of the dominant tube when
-    ``blend = 0``): colors follow the members and blend only in the fillets.
+    ``value_field`` is the average of the tubes' values weighted by
+    ``exp(f_i / tau) - 1`` (the value of the dominant tube when ``blend = 0``):
+    colors follow the members and blend only where they meet.
+    :func:`union_fields` combines two whole fields with the same rule (crease
+    angle from their central-difference gradients).
 
-Memory is bounded: the work is split into batches of at most ``_BATCH`` grid-point
-evaluations (~60 MB of temporaries); besides the two output arrays nothing scales
-with the grid. Pure numpy, no global mutable state.
+Memory is bounded: the grid is processed in slabs of at most ``_SLAB_CELLS``
+cells along x (the per-point accumulators live only for one slab) and the kernel
+evaluations in batches of at most ``_BATCH`` points (~100 MB of temporaries);
+besides the two output arrays nothing scales with the grid. Pure numpy, no
+global mutable state.
 """
 
 from dataclasses import dataclass
@@ -63,6 +90,7 @@ __all__ = [
     "TUBE_ISO",
     "TUBE_SUPPORT",
     "TAU_MAX",
+    "MAX_CELLS",
     "blend_tau",
     "tubes_field",
     "evaluate_tubes",
@@ -75,9 +103,13 @@ _T_ISO = float(np.sqrt(1.0 - TUBE_ISO ** (1.0 / 3.0)))  # kernel argument at the
 TUBE_SUPPORT = 1.0 / _T_ISO  # radius of influence / tube radius (~2.2018)
 TAU_MAX = 0.25  # soft-max temperature at blend = 1
 _TAU_MIN = 0.005  # below this the union is the exact maximum
-_BATCH = 1 << 19  # grid-point evaluations per batch (bounds the temporaries)
+_TAU_ANGLE = 0.1  # fixed temperature of the weights that average the crease angle
+_PAIR_TOL = 1e-9  # pair weight (relative) below which one tube dominates alone
+_BATCH = 1 << 18  # grid-point evaluations per batch (bounds the temporaries)
 _COLUMN_BATCH = 1 << 18  # grid columns per batch of segments
-_RESAMPLE_BLOCK = 1 << 22  # output elements per block in resample_to / union_fields
+_SLAB_CELLS = 1 << 20  # cells per slab of accumulators (8 float64 arrays: 64 MB)
+_RESAMPLE_BLOCK = 1 << 22  # output elements per block in resample_to
+_UNION_BLOCK = 1 << 20  # elements per block in union_fields (gradients need ~12 temporaries)
 MAX_CELLS = 60_000_000  # refuse larger grids (the two float64 outputs alone ~1 GB)
 
 
@@ -228,17 +260,31 @@ def _segments(tubes) -> Optional[_Segments]:
     return _Segments(*cols, np.concatenate(owners))
 
 
+def _segment_boxes(seg: _Segments, ids, origin, h) -> tuple:
+    """Index ranges ``(lo, hi)`` ``(len(ids), 3)`` int64 of the cells whose centres may lie
+    in the extended slab + support cylinder of segments ``ids`` (not clipped to a grid)."""
+    u = seg.u[ids]
+    a = seg.a[ids]
+    start = a - seg.ext0[ids, None] * u
+    end = a + (seg.length[ids] + seg.ext1[ids])[:, None] * u
+    half = seg.support[ids, None] * np.sqrt(np.maximum(1.0 - u * u, 0.0))
+    lo = np.ceil((np.minimum(start, end) - half - origin) / h - 0.5).astype(np.int64)
+    hi = np.floor((np.maximum(start, end) + half - origin) / h - 0.5).astype(np.int64)
+    return lo, hi
+
+
 class _Columns:
     """Grid columns (lines of grid points along one axis) crossing segment slabs.
 
     For column ``c`` of segment ``sid[c]``: grid points ``cell0[c] + k * stride[c]``
     for ``k = 0 .. count[c] - 1``, at offsets ``z0[c] + k * h`` along the column
-    axis from the segment start; ``p_dot[c]`` / ``q_perp2[c]`` are the projection on
-    the segment direction and the squared length of the column's offset in the two
-    other axes, ``u_col[c]`` the direction component along the column.
+    axis ``axis[c]`` from the segment start; ``w1[c]``, ``w2[c]`` are the offsets
+    along the two other axes (``axis + 1``, ``axis + 2`` mod 3), ``p_dot[c]`` /
+    ``q_perp2[c]`` their projection on the segment direction and squared length,
+    ``u_col``, ``u1``, ``u2`` the direction components along the three axes.
     """
 
-    def __init__(self, sid, cell0, stride, z0, count, p_dot, q_perp2, u_col):
+    def __init__(self, sid, cell0, stride, z0, count, p_dot, q_perp2, u_col, axis, w1, w2, u1, u2):
         self.sid = sid
         self.cell0 = cell0
         self.stride = stride
@@ -247,10 +293,16 @@ class _Columns:
         self.p_dot = p_dot
         self.q_perp2 = q_perp2
         self.u_col = u_col
+        self.axis = axis
+        self.w1 = w1
+        self.w2 = w2
+        self.u1 = u1
+        self.u2 = u2
 
 
-def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
-    """Columns of the extended slabs of segments ``ids`` (empty columns dropped).
+def _segment_columns(seg: _Segments, ids, shape, origin, h, lo_clip, hi_clip) -> _Columns:
+    """Columns of the extended slabs of segments ``ids`` within the cell box
+    ``lo_clip .. hi_clip`` (inclusive index bounds per axis); empty columns dropped.
 
     Each segment uses the grid axis closest to its direction as column axis, so
     the slab crosses every column over a short interval; the interval of a column
@@ -258,7 +310,8 @@ def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
     ``support`` around the segment axis (a quadratic). Columns keep the segment
     order.
     """
-    shape_a = np.asarray(shape, dtype=np.int64)
+    lo_clip = np.asarray(lo_clip, dtype=np.int64)
+    hi_clip = np.asarray(hi_clip, dtype=np.int64)
     strides = np.array([shape[1] * shape[2], shape[2], 1], dtype=np.int64)
     u = seg.u[ids]
     rows = np.arange(ids.size)
@@ -267,13 +320,9 @@ def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
     axis_2 = (axis_c + 2) % 3
     a = seg.a[ids]
     s = seg.support[ids]
-    start = a - seg.ext0[ids, None] * u
-    end = a + (seg.length[ids] + seg.ext1[ids])[:, None] * u
-    half = s[:, None] * np.sqrt(np.maximum(1.0 - u * u, 0.0))
-    lo_i = np.ceil((np.minimum(start, end) - half - origin) / h - 0.5)
-    hi_i = np.floor((np.maximum(start, end) + half - origin) / h - 0.5)
-    lo_i = np.clip(lo_i, 0, shape_a).astype(np.int64)
-    hi_i = np.clip(hi_i, -1, shape_a - 1).astype(np.int64)
+    lo_i, hi_i = _segment_boxes(seg, ids, origin, h)
+    lo_i = np.clip(lo_i, lo_clip, hi_clip + 1)
+    hi_i = np.clip(hi_i, lo_clip - 1, hi_clip)
     n_ax = np.maximum(hi_i - lo_i + 1, 0)
     n1 = n_ax[rows, axis_1]
     n2 = n_ax[rows, axis_2]
@@ -296,11 +345,12 @@ def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
     del local, n2_c
     w1 = per_column(w1_0) + m1 * h
     w2 = per_column(w2_0) + m2 * h
-    p_dot = w1 * per_column(u[rows, axis_1])
-    p_dot += w2 * per_column(u[rows, axis_2])
+    u1 = per_column(u[rows, axis_1])
+    u2 = per_column(u[rows, axis_2])
+    p_dot = w1 * u1
+    p_dot += w2 * u2
     q_perp2 = w1 * w1
     q_perp2 += w2 * w2
-    del w1, w2
     uc = per_column(u[rows, axis_c])
     tol = 1e-6 * h
     # slab: -ext0 <= p_dot + z * uc <= length + ext1   (|uc| >= 1/sqrt(3))
@@ -323,11 +373,13 @@ def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
         np.minimum(z_hi, np.where(flat_axis, np.inf, (-qb + root) / (2.0 * qa)), out=z_hi)
     del qa, qb, qc, disc, root, flat_axis
     a_rel_c = per_column(a_rel)
-    n_c = per_column(shape_a[axis_c])
-    k0 = np.clip(np.ceil((a_rel_c + z_lo) / h - 0.5), 0, n_c).astype(np.int64)
-    k1 = np.clip(np.floor((a_rel_c + z_hi) / h - 0.5), -1, n_c - 1).astype(np.int64)
+    k_lo = per_column(lo_clip[axis_c])
+    k_hi = per_column(hi_clip[axis_c])
+    with np.errstate(invalid="ignore"):
+        k0 = np.clip(np.ceil((a_rel_c + z_lo) / h - 0.5), k_lo, k_hi + 1).astype(np.int64)
+        k1 = np.clip(np.floor((a_rel_c + z_hi) / h - 0.5), k_lo - 1, k_hi).astype(np.int64)
     count = np.where(ok & (z_lo <= z_hi), np.maximum(k1 - k0 + 1, 0), 0)
-    del z_lo, z_hi, k1, n_c, ok
+    del z_lo, z_hi, k1, k_lo, k_hi, ok
     keep = np.flatnonzero(count)
     col = np.repeat(rows, n_cols)[keep]
     stride = strides[axis_c][col]
@@ -335,160 +387,337 @@ def _segment_columns(seg: _Segments, ids, shape, origin, h) -> _Columns:
     cell0 = (lo1 * strides[axis_1] + lo2 * strides[axis_2])[col]
     cell0 += m1[keep] * strides[axis_1][col] + m2[keep] * strides[axis_2][col] + k0 * stride
     z0 = (k0 + 0.5) * h - a_rel_c[keep]
-    return _Columns(ids[col], cell0, stride, z0, count[keep], p_dot[keep], q_perp2[keep], uc[keep])
+    return _Columns(
+        ids[col], cell0, stride, z0, count[keep], p_dot[keep], q_perp2[keep], uc[keep],
+        axis_c[col].astype(np.int8), w1[keep], w2[keep], u1[keep], u2[keep],
+    )
 
 
-def _evaluate_points(seg: _Segments, cols: _Columns, sl: slice, h: float) -> tuple:
+def _evaluate_points(seg: _Segments, cols: _Columns, sl: slice, h: float, with_dir: bool) -> tuple:
     """Kernel values at the grid points of columns ``sl``.
 
-    Returns ``(cell, owner, f, value)`` for the points with ``f > 0``.
+    Returns ``(cell, owner, f, value, direction)`` for the points with ``f > 0``;
+    ``direction (K, 3)`` (or ``None`` unless ``with_dir``) is the unit vector from
+    the point to the closest point of the segment's axis (the direction of the
+    kernel's gradient; zero on the axis).
     """
     count = cols.count[sl]
     sid = cols.sid[sl]
     total = int(count.sum())
-    step = np.arange(total, dtype=np.int64) - np.repeat(np.cumsum(count) - count, count)
-    cell = np.repeat(cols.cell0[sl], count) + step * np.repeat(cols.stride[sl], count)
-    z = np.repeat(cols.z0[sl], count) + step * h
-    del step
-    proj = np.repeat(cols.u_col[sl], count) * z
-    proj += np.repeat(cols.p_dot[sl], count)
-    t = proj * np.repeat(seg.inv_length[sid], count)
+
+    def rep(values):
+        return np.repeat(values, count)
+
+    step = np.arange(total, dtype=np.int64)
+    step -= rep(np.cumsum(count) - count)
+    z = step * h  # offset from the segment start along the column axis
+    z += rep(cols.z0[sl])
+    proj = z * rep(cols.u_col[sl])
+    proj += rep(cols.p_dot[sl])  # (p - a) . u
+    t = proj * rep(seg.inv_length[sid])
     np.clip(t, 0.0, 1.0, out=t)
-    tl = t * np.repeat(seg.length[sid], count)
+    tl = t * rep(seg.length[sid])
     # squared distance to the closest point a + t * length * u
     d2 = z * z
-    d2 += np.repeat(cols.q_perp2[sl], count)
+    d2 += rep(cols.q_perp2[sl])
     proj *= 2.0
     proj -= tl
     proj *= tl
     d2 -= proj
-    del z, proj, tl
-    r = t * np.repeat(seg.dr[sid], count)
-    r += np.repeat(seg.ra[sid], count)
-    u2 = d2 / (r * r)
-    u2 *= _T_ISO * _T_ISO
-    del d2, r
+    del proj
+    r = t * rep(seg.dr[sid])
+    r += rep(seg.ra[sid])
+    r *= r
+    r *= 1.0 / (_T_ISO * _T_ISO)
+    u2 = np.divide(d2, r, out=r)
     keep = np.flatnonzero(u2 < 1.0)
     f = 1.0 - np.maximum(u2[keep], 0.0)
-    f = f * f * f
-    owner_col = seg.owner[sid]
-    item = np.repeat(np.arange(sid.size), count)[keep]
-    value = seg.va[sid[item]] + t[keep] * seg.dv[sid[item]]
-    return cell[keep], owner_col[item], f, value
+    f *= f * f
+    del u2, r
+    item = np.searchsorted(np.cumsum(count), keep, side="right")  # column of every kept point
+    sid_k = sid[item]
+    value = t[keep]
+    value *= seg.dv[sid_k]
+    value += seg.va[sid_k]
+    cell = step[keep]
+    del step, t
+    cell *= cols.stride[sl][item]
+    cell += cols.cell0[sl][item]
+    direction = None
+    if with_dir:
+        tk = tl[keep]
+        # (p - closest) in the (column, 1, 2) frame, scaled to -unit
+        dist = np.sqrt(np.maximum(d2[keep], 0.0))
+        scale = np.zeros(dist.size)
+        np.divide(-1.0, dist, out=scale, where=dist > 0.0)
+        c0 = z[keep] - tk * cols.u_col[sl][item]
+        c1 = cols.w1[sl][item] - tk * cols.u1[sl][item]
+        c2 = cols.w2[sl][item] - tk * cols.u2[sl][item]
+        c0 *= scale
+        c1 *= scale
+        c2 *= scale
+        ax = cols.axis[sl][item]
+        direction = np.empty((keep.size, 3))
+        # world component a takes c0 if a == axis, c1 if a == axis + 1, c2 if a == axis + 2
+        direction[:, 0] = np.where(ax == 0, c0, np.where(ax == 2, c1, c2))
+        direction[:, 1] = np.where(ax == 1, c0, np.where(ax == 0, c1, c2))
+        direction[:, 2] = np.where(ax == 2, c0, np.where(ax == 1, c1, c2))
+    return cell, seg.owner[sid_k], f, value, direction
 
 
-def _group_max(keys: np.ndarray, f: np.ndarray, v: np.ndarray) -> tuple:
-    """Per run of equal sorted ``keys``: max of ``f`` and the ``v`` at that max.
+def _run_starts(keys: np.ndarray) -> np.ndarray:
+    """Start positions of the runs of equal values of sorted ``keys``."""
+    if keys.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    return np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
 
-    (Ties average their values.) Returns ``(starts, fmax, vmax)``.
-    """
-    starts = np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
-    if starts.size == keys.size:
-        return starts, f, v
+
+def _last_max(starts: np.ndarray, f: np.ndarray) -> tuple:
+    """Position of the last maximum of every run ``f[starts[k]:starts[k + 1]]`` and the maxima."""
     fmax = np.maximum.reduceat(f, starts)
-    at_max = f == np.repeat(fmax, np.diff(np.append(starts, keys.size)))
-    v_sum = np.add.reduceat(np.where(at_max, v, 0.0), starts)
-    n_max = np.add.reduceat(at_max.astype(np.float64), starts)
-    return starts, fmax, v_sum / n_max
+    counts = np.diff(np.append(starts, f.size))
+    pos = np.where(f == np.repeat(fmax, counts), np.arange(f.size), -1)
+    return np.maximum.reduceat(pos, starts), fmax
 
 
-def _combine(cell, owner, f, v, tau, acc, val, open_owner) -> Optional[tuple]:
-    """Fold kernel values into the accumulators.
+def _tube_maxima(cell, owner, f, value, direction, open_owner: int) -> tuple:
+    """One row per (cell, tube): the tube's own field (maximum over its segments) and the
+    value / direction of the maximizing segment.
 
-    First the maximum per (cell, tube) (the tube's own field), then the soft-max sum
-    (``tau > 0``: ``acc += exp(f / tau) - 1``, ``val += weight * value``) or the hard
-    maximum (``acc = max``, ``val = value of the max``) over tubes. Rows of tube
-    ``open_owner`` (continued in the next batch) are returned as the carry instead.
+    Rows come sorted by cell, then tube - except the rows of tube ``open_owner``
+    (still continuing, ``-1``: none), which come last. Returns the rows and the
+    number of those trailing rows.
     """
-    if cell.size == 0:
-        return None
     o0 = int(owner.min())
     span = int(owner.max()) - o0 + 1
-    keys = cell * span + (owner - o0)
-    order = np.argsort(keys, kind="stable")
-    keys = keys[order]
-    starts, f, v = _group_max(keys, f[order], v[order])
-    keys = keys[starts]
-    owner = keys % span + o0
-    cell = keys // span
-    carry = None
+    keys = cell * span
+    keys += owner - o0
+    held = None
     if open_owner >= 0:
         held = owner == open_owner
-        if held.any():
-            carry = (cell[held], owner[held], f[held], v[held])
-            rest = ~held
-            cell, f, v = cell[rest], f[rest], v[rest]
-    if cell.size:
-        if tau > 0.0:
-            cstarts = np.flatnonzero(np.concatenate(([True], cell[1:] != cell[:-1])))
-            ucell = cell[cstarts]
-            w = np.expm1(f / tau)
-            acc[ucell] += np.add.reduceat(w, cstarts)
-            val[ucell] += np.add.reduceat(w * v, cstarts)
-        else:
-            cstarts, fmax, vmax = _group_max(cell, f, v)
-            ucell = cell[cstarts]
-            better = fmax > acc[ucell]
-            acc[ucell[better]] = fmax[better]
-            val[ucell[better]] = vmax[better]
-    return carry
+        keys += held * ((int(cell.max()) + 1) * span)
+    order = np.argsort(keys)
+    starts = _run_starts(keys[order])
+    if starts.size < order.size:
+        pick, _fmax = _last_max(starts, f[order])
+        order = order[pick]
+    n_held = 0 if held is None else int(np.count_nonzero(held[order]))
+    rows = (
+        cell[order],
+        owner[order],
+        f[order],
+        value[order],
+        None if direction is None else direction[order],
+    )
+    return rows, n_held
 
 
-def _segment_batches(seg: _Segments, shape, h) -> list:
-    """Consecutive segment ranges with at most ~``_COLUMN_BATCH`` columns each.
+class _Accumulator:
+    """Per-cell sums over tubes for one slab of cells (``n`` cells from flat id ``base``).
+
+    ``tau == 0``: maximum and the value at the maximum. ``tau > 0``: maximum, soft
+    sum ``sum(exp(f / tau) - 1)``, weighted value sum, and for the crease angle the
+    sums of the angle weights ``w = exp(f / _TAU_ANGLE) - 1``, of ``w ** 2`` and of
+    ``w * direction``.
+    """
+
+    def __init__(self, n: int, base: int, tau: float):
+        self.base = int(base)
+        self.tau = float(tau)
+        self.fmax = np.zeros(n)
+        self.val = np.zeros(n)
+        if self.tau > 0.0:
+            self.soft = np.zeros(n)
+            self.wsum = np.zeros(n)
+            self.wsq = np.zeros(n)
+            self.wdir = np.zeros((n, 3))
+
+    def add(self, cell, f, value, direction) -> None:
+        """Add rows sorted by cell, at most one per (cell, tube), each tube complete."""
+        if cell.size == 0:
+            return
+        starts = _run_starts(cell)
+        ucell = cell[starts] - self.base
+        if self.tau == 0.0:
+            last, fmax = _last_max(starts, f)
+            better = fmax > self.fmax[ucell]
+            self.fmax[ucell[better]] = fmax[better]
+            self.val[ucell[better]] = value[last[better]]
+            return
+        self.fmax[ucell] = np.maximum(self.fmax[ucell], np.maximum.reduceat(f, starts))
+        w = np.expm1(f / self.tau)
+        self.soft[ucell] += np.add.reduceat(w, starts)
+        w *= value
+        self.val[ucell] += np.add.reduceat(w, starts)
+        wa = np.expm1(f / _TAU_ANGLE)
+        self.wdir[ucell] += np.add.reduceat(direction * wa[:, None], starts, axis=0)
+        self.wsum[ucell] += np.add.reduceat(wa, starts)
+        wa *= wa
+        self.wsq[ucell] += np.add.reduceat(wa, starts)
+
+    def finish(self, field_out: np.ndarray, value_out: np.ndarray) -> None:
+        """Write the blended field and the value field of the slab."""
+        if self.tau == 0.0:
+            field_out[:] = self.fmax
+            value_out[:] = self.val
+            return
+        field_out[:] = 0.0
+        value_out[:] = 0.0
+        hit = np.flatnonzero(self.soft > 0.0)  # cells reached by some tube
+        if hit.size == 0:
+            return
+        tau = self.tau
+        F = self.fmax[hit]
+        S = self.soft[hit]
+        value_out[hit] = self.val[hit] / S
+        # crease angle: weighted mean pairwise misalignment 1 - cos(theta_ij)
+        W = self.wsum[hit]
+        W *= W
+        pairs = W - self.wsq[hit]
+        d = self.wdir[hit]
+        spread = W - np.einsum("ij,ij->i", d, d)
+        del d
+        mis = np.zeros(hit.size)
+        np.divide(spread, pairs, out=mis, where=pairs > _PAIR_TOL * W)
+        np.clip(mis, 0.0, 2.0, out=mis)
+        del W, pairs, spread
+        # sin(theta) for theta < 90 deg, else 1 (C1 at 90 deg)
+        g = np.where(mis >= 1.0, 1.0, np.sqrt(np.maximum(mis * (2.0 - mis), 0.0)))
+        del mis
+        # soft maximum G of the other tubes, kept below F + g (G - F) as g vanishes
+        rest = (1.0 + S) - np.exp(F / tau)
+        np.maximum(rest, 0.0, out=rest)
+        G = np.log1p(rest)
+        G *= tau
+        del rest, S
+        over = np.maximum(G - F, 0.0)
+        over *= g
+        over += F
+        np.minimum(G, over, out=G)
+        del over
+        g *= tau
+        field_out[hit] = _soft_max2(F, G, g)
+
+
+def _soft_max2(a: np.ndarray, b: np.ndarray, t) -> np.ndarray:
+    """``t * ln(exp(a / t) + exp(b / t) - 1)`` (overflow free; the maximum where ``t <= 0``)."""
+    hi = np.maximum(a, b)
+    lo = np.minimum(a, b)
+    t = np.broadcast_to(np.asarray(t, dtype=np.float64), hi.shape)
+    pos = t > 0.0
+    safe = np.where(pos, t, 1.0)
+    with np.errstate(under="ignore", over="ignore"):
+        extra = np.exp((lo - hi) / safe)
+        extra -= np.exp(-hi / safe)
+    np.maximum(extra, 0.0, out=extra)
+    np.log1p(extra, out=extra)
+    extra *= t
+    extra[~pos] = 0.0
+    extra += hi
+    return extra
+
+
+def _aligned_end(end: int, start: int, first_of_run: np.ndarray, owner: np.ndarray) -> int:
+    """Move a batch end back to the start of the tube it would split, if that keeps the
+    batch non-empty (only tubes larger than a whole batch are split)."""
+    if end < owner.size and owner[end] == owner[end - 1]:
+        first = int(first_of_run[end - 1])
+        if first > start:
+            return first
+    return end
+
+
+def _run_firsts(owner: np.ndarray) -> np.ndarray:
+    """For every position of a sequence of runs, the position where its run starts."""
+    starts = _run_starts(owner)
+    return np.repeat(starts, np.diff(np.append(starts, owner.size)))
+
+
+def _segment_batches(seg: _Segments, ids: np.ndarray, h: float, max_extent: int) -> list:
+    """Split ``ids`` into consecutive ranges with at most ~``_COLUMN_BATCH`` columns each,
+    cut between tubes whenever possible.
 
     The column count of a segment is bounded by its cylinder's extent; a range
-    always holds at least one segment.
+    always holds at least one segment. Returns boundaries into ``ids``.
     """
-    extent = 2.0 * seg.support + seg.length + seg.ext0 + seg.ext1
-    cols = (np.minimum(extent / h + 2.0, max(shape))) ** 2
+    extent = 2.0 * seg.support[ids] + seg.length[ids] + seg.ext0[ids] + seg.ext1[ids]
+    cols = (np.minimum(extent / h + 2.0, max_extent)) ** 2
     cum = np.cumsum(cols)
+    owner = seg.owner[ids]
+    firsts = _run_firsts(owner)
     bounds = [0]
-    while bounds[-1] < seg.n:
-        base = cum[bounds[-1] - 1] if bounds[-1] else 0.0
+    while bounds[-1] < ids.size:
+        start = bounds[-1]
+        base = cum[start - 1] if start else 0.0
         end = int(np.searchsorted(cum, base + _COLUMN_BATCH, side="right"))
-        bounds.append(min(max(end, bounds[-1] + 1), seg.n))
+        end = min(max(end, start + 1), ids.size)
+        bounds.append(_aligned_end(end, start, firsts, owner))
     return bounds
 
 
 def _field_on_grid(seg, shape, origin, h, tau, progress, should_stop) -> tuple:
     n_cells = int(np.prod(shape))
-    acc = np.zeros(n_cells, dtype=np.float64)
-    val = np.zeros(n_cells, dtype=np.float64)
-    if seg is not None:
-        bounds = _segment_batches(seg, shape, h)
-        carry = None
-        for b0, b1 in zip(bounds[:-1], bounds[1:]):
-            check_stop(should_stop)
-            cols = _segment_columns(seg, np.arange(b0, b1), shape, origin, h)
-            n_cols = cols.count.size
-            cum = np.cumsum(cols.count)
-            owners = seg.owner[cols.sid]
-            next_owner = int(seg.owner[b1]) if b1 < seg.n else -1
-            start = 0
-            while start < n_cols:
+    field = np.zeros(n_cells, dtype=np.float64)
+    value = np.zeros(n_cells, dtype=np.float64)
+    if seg is None:
+        return field.reshape(shape), value.reshape(shape)
+    layer = shape[1] * shape[2]
+    thick = max(1, _SLAB_CELLS // layer)
+    hi_grid = np.asarray(shape, dtype=np.int64) - 1
+    box_lo, box_hi = _segment_boxes(seg, np.arange(seg.n), origin, h)
+    in_grid = np.all((box_hi >= 0) & (box_lo <= hi_grid), axis=1)
+    slabs = list(range(0, shape[0], thick))
+    with_dir = tau > 0.0
+    for s_index, x0 in enumerate(slabs):
+        x1 = min(x0 + thick, shape[0])
+        check_stop(should_stop)
+        ids = np.flatnonzero(in_grid & (box_lo[:, 0] < x1) & (box_hi[:, 0] >= x0))
+        acc = _Accumulator((x1 - x0) * layer, x0 * layer, tau)
+        if ids.size:
+            lo_clip = np.array([x0, 0, 0], dtype=np.int64)
+            hi_clip = np.array([x1 - 1, shape[1] - 1, shape[2] - 1], dtype=np.int64)
+            bounds = _segment_batches(seg, ids, h, max(shape))
+            carry = None  # rows of a tube that continues into the next batch
+            for b0, b1 in zip(bounds[:-1], bounds[1:]):
                 check_stop(should_stop)
-                base = int(cum[start - 1]) if start else 0
-                end = int(np.searchsorted(cum, base + _BATCH, side="right"))
-                end = min(max(end, start + 1), n_cols)
-                cell, owner, f, v = _evaluate_points(seg, cols, slice(start, end), h)
-                if carry is not None:
-                    cell, owner, f, v = (
-                        np.concatenate(pair) for pair in zip(carry, (cell, owner, f, v))
-                    )
-                last = int(owners[end - 1])
-                follows = int(owners[end]) if end < n_cols else next_owner
-                carry = _combine(cell, owner, f, v, tau, acc, val, last if follows == last else -1)
-                start = end
-            if progress is not None:
-                progress(b1 / seg.n, "Fusing tubes")
-        if carry is not None:  # cannot happen: the last tube closes the stream
-            _combine(*carry, tau, acc, val, -1)
-    if tau > 0.0:
-        np.divide(val, acc, out=val, where=acc > 0.0)
-        np.log1p(acc, out=acc)
-        acc *= tau
-    return acc.reshape(shape), val.reshape(shape)
+                cols = _segment_columns(seg, ids[b0:b1], shape, origin, h, lo_clip, hi_clip)
+                n_cols = cols.count.size
+                cum = np.cumsum(cols.count)
+                owners = seg.owner[cols.sid]
+                firsts = _run_firsts(owners)
+                next_owner = int(seg.owner[ids[b1]]) if b1 < ids.size else -1
+                start = 0
+                while start < n_cols:
+                    check_stop(should_stop)
+                    base = int(cum[start - 1]) if start else 0
+                    end = int(np.searchsorted(cum, base + _BATCH, side="right"))
+                    end = min(max(end, start + 1), n_cols)
+                    end = _aligned_end(end, start, firsts, owners)
+                    rows = _evaluate_points(seg, cols, slice(start, end), h, with_dir)
+                    if carry is not None:
+                        rows = tuple(
+                            None if new is None else np.concatenate([old, new])
+                            for old, new in zip(carry, rows)
+                        )
+                        carry = None
+                    last = int(owners[end - 1])
+                    follows = int(owners[end]) if end < n_cols else next_owner
+                    if rows[0].size:
+                        rows, n_held = _tube_maxima(*rows, last if follows == last else -1)
+                        if n_held:  # the last tube continues: hold its rows back
+                            cut = rows[0].size - n_held
+                            carry = tuple(None if r is None else r[cut:] for r in rows)
+                            rows = tuple(None if r is None else r[:cut] for r in rows)
+                        acc.add(rows[0], rows[2], rows[3], rows[4])
+                    start = end
+                if progress is not None:
+                    progress((s_index + b1 / ids.size) / len(slabs), "Fusing tubes")
+            if carry is not None:  # cannot happen: the last tube closes the stream
+                acc.add(carry[0], carry[2], carry[3], carry[4])
+        sl = slice(x0 * layer, x1 * layer)
+        acc.finish(field[sl], value[sl])
+        del acc
+    return field.reshape(shape), value.reshape(shape)
 
 
 def _check_grid(shape, h) -> tuple:
@@ -510,7 +739,8 @@ def evaluate_tubes(tubes, shape, origin, h, blend=0.5, progress=None, should_sto
     """Tube field on a given element-centred grid ``(shape, origin, h)``.
 
     Same field as :func:`tubes_field` (see the module docstring), but on the caller's
-    grid. Returns ``(field, value_field)``, both ``shape`` float64.
+    grid (tubes may extend beyond it). Returns ``(field, value_field)``, both
+    ``shape`` float64.
     """
     shape = _check_grid(shape, h)
     origin = np.asarray(origin, dtype=np.float64).reshape(3)
@@ -526,11 +756,12 @@ def tubes_field(tubes, voxel_size, blend=0.5, pad=2, progress=None, should_stop=
     The grid (spacing ``voxel_size``, element-centred) covers the tubes' supports
     (radius x :data:`TUBE_SUPPORT`) plus ``pad`` voxels per side. ``blend`` in
     [0, 1]: 0 = hard union, 1 = softest fillets (see the module docstring).
-    ``progress(fraction, message)`` / ``should_stop()`` are polled per batch (~0.05 s).
+    ``progress(fraction, message)`` / ``should_stop()`` are polled per batch (~0.1 s).
 
     Returns ``(field, origin, h, value_field)``: ``field (nx, ny, nz)`` >= 0, the grid
     origin ``(3,)``, ``h = voxel_size`` and the blended tube values ``(nx, ny, nz)``
     (0 where no tube reaches). Without any valid tube: a ``(1, 1, 1)`` zero field.
+    Raises ``ValueError`` if the grid would exceed :data:`MAX_CELLS` cells.
     """
     h = float(voxel_size)
     if not h > 0.0:
@@ -602,6 +833,8 @@ def resample_to(field, src_origin, src_h, dst_shape, dst_origin, dst_h) -> np.nd
         raise ValueError("dst_shape must be three positive integers")
     src_h = float(src_h)
     dst_h = float(dst_h)
+    if not (src_h > 0.0 and dst_h > 0.0):
+        raise ValueError("grid spacings must be positive")
     # Shrinking axes first keeps the intermediate arrays small.
     order = sorted(range(3), key=lambda a: dst_shape[a] / out.shape[a])
     for axis in order:
@@ -611,14 +844,29 @@ def resample_to(field, src_origin, src_h, dst_shape, dst_origin, dst_h) -> np.nd
     return out
 
 
+def _unit_gradient(block: np.ndarray, axes: tuple) -> np.ndarray:
+    """Unit central-difference gradient ``(len(axes), ...)`` of ``block`` (0 where flat)."""
+    grads = np.gradient(block, axis=axes)
+    if len(axes) == 1:
+        grads = [grads]
+    g = np.stack(grads)
+    norm = np.sqrt(np.einsum("i...,i...->...", g, g))
+    np.divide(g, norm, out=g, where=norm > 0.0)
+    g[:, norm <= 0.0] = 0.0
+    return g
+
+
 def union_fields(a, b, blend) -> np.ndarray:
     """Smooth union of two non-negative fields with the rule of :func:`tubes_field`.
 
-    ``U(a, b) = tau * ln(exp(a / tau) + exp(b / tau) - 1)`` (``tau = TAU_MAX * blend``,
-    the maximum for ``blend = 0``), evaluated in the overflow-free form
-    ``m + tau * log1p(exp((n - m) / tau) - exp(-m / tau))`` with ``m = max``,
-    ``n = min``. ``U(a, 0) = a`` exactly. Negative inputs are treated as 0. Arrays
-    broadcast; returns float64.
+    ``U = tau' ln(exp(a / tau') + exp(b / tau') - 1)`` with ``tau' = TAU_MAX * blend *
+    sin(theta)`` (``theta`` = angle between the central-difference gradients of ``a``
+    and ``b``, capped at 90 degrees; flat spots count as 90), the maximum for
+    ``blend = 0``. So ``max(a, b) <= U <= soft-max``, ``U(a, 0) = a`` exactly,
+    ``U(a, b) = U(b, a)``, non-decreasing in ``blend``; fillets where the surfaces
+    cross, no swelling where they overlap with parallel gradients. Both fields
+    must be sampled on the same regular grid (same spacing on every axis);
+    negative inputs count as 0. Arrays broadcast; returns float64.
     """
     tau = blend_tau(blend)
     a = np.asarray(a, dtype=np.float64)
@@ -627,24 +875,28 @@ def union_fields(a, b, blend) -> np.ndarray:
     out = np.empty(a.shape, dtype=np.float64)
     if out.size == 0:
         return out
-    if not (a.flags.c_contiguous and b.flags.c_contiguous):
-        a = np.ascontiguousarray(a)
-        b = np.ascontiguousarray(b)
-    fa, fb, fo = a.reshape(-1), b.reshape(-1), out.reshape(-1)
-    for s0 in range(0, fo.size, _RESAMPLE_BLOCK):
-        sl = slice(s0, s0 + _RESAMPLE_BLOCK)
-        x = np.maximum(fa[sl], 0.0)
-        y = np.maximum(fb[sl], 0.0)
-        hi = np.maximum(x, y)
-        if tau == 0.0:
-            fo[sl] = hi
-            continue
-        lo = np.minimum(x, y)
-        extra = np.exp((lo - hi) / tau)
-        extra -= np.exp(-hi / tau)
-        np.maximum(extra, 0.0, out=extra)
-        np.log1p(extra, out=extra)
-        extra *= tau
-        extra += hi
-        fo[sl] = extra
+    if tau == 0.0:
+        out[...] = np.maximum(np.maximum(a, b), 0.0)
+        return out
+    if out.ndim == 0:  # no gradient: the plain soft maximum
+        out[...] = _soft_max2(np.maximum(a, 0.0), np.maximum(b, 0.0), tau)
+        return out
+    axes = tuple(ax for ax in range(out.ndim) if out.shape[ax] >= 2)
+    n0 = out.shape[0]
+    per_row = max(1, out.size // n0)
+    step = max(1, _UNION_BLOCK // per_row)
+    for s0 in range(0, n0, step):
+        s1 = min(s0 + step, n0)
+        h0 = max(s0 - 1, 0)  # one halo row on each side for the central differences
+        h1 = min(s1 + 1, n0)
+        x = np.maximum(a[h0:h1], 0.0)
+        y = np.maximum(b[h0:h1], 0.0)
+        inner = slice(s0 - h0, s0 - h0 + (s1 - s0))
+        if axes:
+            cos = np.einsum("i...,i...->...", _unit_gradient(x, axes), _unit_gradient(y, axes))[inner]
+            mis = np.clip(1.0 - cos, 0.0, 2.0)
+            g = np.where(mis >= 1.0, 1.0, np.sqrt(np.maximum(mis * (2.0 - mis), 0.0)))
+        else:
+            g = 1.0
+        out[s0:s1] = _soft_max2(x[inner], y[inner], g * tau)
     return out

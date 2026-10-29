@@ -212,16 +212,20 @@ class SceneCache:
       ``settings`` (topopt.OptSettings), ``signature``, ``info``, ``max_displacement``
     * ``lines``     -- dict ``lines`` (list of streamlines.Polyline), ``grid``,
       ``h``, ``source``, ``signature``, ``magnitude_ref``
+    * ``structure`` -- dict of the last "Generate Structure": ``kind``, ``mode``,
+      ``signature`` and, for the organic shape (reused by the ribs), ``problem``,
+      ``state``, ``organic_signature``
 
     Each is ``None`` until computed. Dict-style reads (``cache["lines"]``) work.
     """
 
-    __slots__ = ("analysis", "evolution", "lines")
+    __slots__ = ("analysis", "evolution", "lines", "structure")
 
     def __init__(self):
         self.analysis = None
         self.evolution = None
         self.lines = None
+        self.structure = None
 
     def __getitem__(self, key):
         if key not in self.__slots__:
@@ -236,6 +240,7 @@ class SceneCache:
         self.analysis = None
         self.evolution = None
         self.lines = None
+        self.structure = None
 
 
 CACHE = {}  # scene name -> SceneCache

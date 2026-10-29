@@ -71,6 +71,37 @@ def vertex_link_cycles(verts, faces):
     return np.bincount(owner[roots], minlength=n), k
 
 
+def upsample_trilinear(field, s):
+    """Trilinear interpolant of a sample lattice at the centres of ``s**3`` sub-cells per cube."""
+    out = np.asarray(field, dtype=np.float64)
+    for axis in range(3):
+        out = np.moveaxis(out, axis, 0)
+        w = ((np.arange(s) + 0.5) / s).reshape((1, s) + (1,) * (out.ndim - 1))
+        up = out[:-1][:, None] * (1.0 - w) + out[1:][:, None] * w  # (n - 1, s, ...)
+        out = np.moveaxis(up.reshape((-1,) + out.shape[1:]), 0, axis)
+    return out
+
+
+def solid_euler(mask):
+    """Euler characteristic of the union of the closed unit cubes of a 3-D boolean mask."""
+    p = np.pad(np.asarray(mask, dtype=bool), 1)
+    a, b, c = p.shape
+    faces = sum(
+        int(np.count_nonzero(np.take(p, range(n - 1), axis=ax) | np.take(p, range(1, n), axis=ax)))
+        for ax, n in enumerate(p.shape)
+    )
+    edges = 0
+    for ax in range(3):
+        q = np.moveaxis(p, ax, 0)
+        edges += int(np.count_nonzero(q[:, :-1, :-1] | q[:, 1:, :-1] | q[:, :-1, 1:] | q[:, 1:, 1:]))
+    corners = np.zeros((a - 1, b - 1, c - 1), dtype=bool)
+    for dx in (0, 1):
+        for dy in (0, 1):
+            for dz in (0, 1):
+                corners |= p[dx : dx + a - 1, dy : dy + b - 1, dz : dz + c - 1]
+    return int(np.count_nonzero(corners)) - edges + faces - int(p.sum())
+
+
 def assert_closed_manifold(verts, faces):
     """Closed, consistently oriented, edge- and vertex-manifold, no degenerate faces."""
     assert verts.dtype == np.float64 and faces.dtype == np.int64
@@ -212,13 +243,25 @@ def touching_blobs(offset, direction, gap, n=26):
 def test_touching_blobs_stay_manifold(direction, gap, offset):
     field, origin, h = touching_blobs(offset, direction, gap)
     verts, quads, info = mesher._surface_nets(field, 0.0, origin, h)
-    assert_closed_manifold(verts, quads)
+    assert_closed_manifold(verts, quads)  # never a pinch (an edge or vertex shared by 4 faces)
     assert info["residual_conflicts"] == 0
     comps = n_components(verts, quads)
     chi = euler_characteristic(verts, quads)
-    assert comps in (1, 2) and chi == 2 * comps  # one or two spheres, never a pinch
+    assert comps in (1, 2) and chi % 2 == 0
     if gap > 0.5 * h:
         assert comps == 2
+    if any(offset):
+        # generic sampling: one or two spheres, no handles
+        assert chi == 2 * comps
+    # The contact region has exactly the topology of the trilinear interpolant of the
+    # samples (supersampled). With samples symmetric about the contact point the
+    # interpolant really has handles there (the (1, 1, 0) cases have genus 2).
+    centre = np.rint((np.asarray(offset) - origin) / h - 0.5).astype(int)
+    window = field[tuple(slice(c - 4, c + 4) for c in centre)]
+    pad = mesher._default_pad(window, 0.0)
+    wv, wq = mesher.surface_nets(window, 0.0, (0, 0, 0), 1.0)
+    dense = upsample_trilinear(np.pad(window, 1, constant_values=pad), 16)
+    assert euler_characteristic(wv, wq) == 2 * solid_euler(dense >= 0.0)
 
 
 def test_diagonal_voxels_binary():
@@ -245,16 +288,27 @@ def test_diagonal_voxels_binary():
 
 
 def test_thin_diagonal_tube_stays_connected():
-    # A thin smooth tube along a face diagonal: diagonal-only inside samples must
-    # join through the faces (asymptotic decider), not fall apart into beads.
+    # A thin smooth tube along a face diagonal, its axis half-way between two sample
+    # planes: only the diagonal samples of both planes are inside, and they must join
+    # through the faces (asymptotic decider), not fall apart into beads.
     n = 24
-    field, origin, h = centred_field(
-        n,
-        lambda x, y, z: 0.7 * h - np.sqrt(((x - y) / np.sqrt(2)) ** 2 + (z - 0.5 * h) ** 2),
-    )
+    h = 2.0 / n  # spacing of centred_field(n, ...); z = 0 lies between two sample planes
+
+    def tube(axis_z):
+        return lambda x, y, z: 0.7 * h - np.sqrt(((x - y) / np.sqrt(2)) ** 2 + (z - axis_z) ** 2)
+
+    field, origin, h = centred_field(n, tube(0.0))
     verts, quads = mesher.surface_nets(field, 0.0, origin, h)
     assert_closed_manifold(verts, quads)
     assert n_components(verts, quads) == 1
+    assert euler_characteristic(verts, quads) == 2
+    # Axis on a sample plane: a single chain of diagonal samples. Joining them would
+    # need two patches meeting twice through each face (an edge in four quads), so the
+    # faces are flipped: separate beads, but never a non-manifold pinch.
+    field, origin, h = centred_field(n, tube(0.5 * h))
+    verts, quads, info = mesher._surface_nets(field, 0.0, origin, h)
+    assert_closed_manifold(verts, quads)
+    assert info["flipped_faces"] > 0 and info["residual_conflicts"] == 0
 
 
 @pytest.mark.parametrize("seed", range(6))
@@ -500,7 +554,8 @@ def test_extrapolate_reach_values_and_channels():
     assert np.allclose(out[3, 1, 0], (2.0, 20.0))
     assert np.allclose(out[3, 0, 0], (1.0, 10.0))
     values, valid = mesher._extrapolate(field, mask, 1)
-    assert valid.sum() == 2 + 3 + 4 - 1  # 3 + 4 neighbours, (3,1,0) shared
+    # (3,0,0) has 4 in-grid neighbours, (3,2,0) has 5; (3,1,0) is shared
+    assert valid.sum() == 2 + 4 + 5 - 1
     assert np.array_equal(mesher.extrapolate(field, np.zeros(shape, bool), 3), field)
 
 

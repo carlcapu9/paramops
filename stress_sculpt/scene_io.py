@@ -367,21 +367,33 @@ def view_layer_objects(context) -> list:
     return [obj for obj in view_layer.objects if obj is not None]
 
 
-def role_objects(context, include_disabled=False) -> list:
-    """Objects with a role (sorted by name), excluding the domain.
+def role_objects(context, include_disabled=False, exclude=()) -> list:
+    """Objects with a role (sorted by name), excluding the domain (and ``exclude``).
 
     Objects of collections excluded from the view layer (e.g. saved variants)
     are not part of the setup.
     """
     domain = context.scene.stress_sculpt.domain
+    skipped = {obj.name for obj in exclude if obj is not None}
     found = []
     for obj in view_layer_objects(context):
         settings = getattr(obj, "stress_sculpt", None)
         if settings is None or settings.role == "NONE" or obj == domain:
             continue
+        if obj.name in skipped:
+            continue
         if settings.enabled or include_disabled:
             found.append(obj)
     return sorted(found, key=lambda o: o.name)
+
+
+def validated_mesh_object(context, obj, what="domain"):
+    """``obj`` checked to be a mesh of the current view layer (ValueError otherwise)."""
+    if obj.type != "MESH":
+        raise ValueError(f"The {what} '{obj.name}' is not a mesh")
+    if obj.name not in {o.name for o in view_layer_objects(context)}:
+        raise ValueError(f"The {what} '{obj.name}' is not in the current scene / view layer")
+    return obj
 
 
 def validated_domain(context, settings):
@@ -391,16 +403,168 @@ def validated_domain(context, settings):
         raise ValueError(
             "No design domain: pick a closed mesh in Setup > Domain, or start from a demo scene"
         )
-    if domain.type != "MESH":
-        raise ValueError(f"The domain '{domain.name}' is not a mesh")
-    if domain.name not in {obj.name for obj in view_layer_objects(context)}:
-        raise ValueError(f"The domain '{domain.name}' is not in the current scene / view layer")
-    return domain
+    return validated_mesh_object(context, domain, "domain")
+
+
+def validated_target(context, settings):
+    """The Structure panel's object (``settings.target``), checked."""
+    target = settings.target
+    if target is None:
+        raise ValueError(
+            "No object: pick the mesh to work with in the Structure panel (or start from an "
+            "example)"
+        )
+    return validated_mesh_object(context, target, "object")
+
+
+# --------------------------------------------------------------- structure inputs
+def structure_loads(context, exclude=()) -> list:
+    """Enabled LOAD objects as dicts ``name, position (3,), force (3,), magnitude, radius``.
+
+    The force is ``magnitude`` newtons along the object's world +Z axis (the
+    arrow). Loads without force or direction are skipped.
+    """
+    loads = []
+    for obj in role_objects(context, exclude=exclude):
+        settings = obj.stress_sculpt
+        if settings.role != "LOAD":
+            continue
+        matrix = np.array(obj.matrix_world, dtype=np.float64)
+        direction = matrix[:3, 2].copy()
+        norm = float(np.linalg.norm(direction))
+        magnitude = float(settings.magnitude)
+        if magnitude <= 0.0 or norm < 1e-12:
+            continue
+        direction /= norm
+        loads.append(
+            {
+                "name": obj.name,
+                "position": matrix[:3, 3].copy(),
+                "direction": direction,
+                "force": magnitude * direction,
+                "magnitude": magnitude,
+                "radius": float(settings.load_radius),
+            }
+        )
+    return loads
+
+
+def structure_supports(context, exclude=()) -> list:
+    """Enabled SUPPORT objects as dicts ``name, position (3,), fix (3,), object name``."""
+    supports = []
+    for obj in role_objects(context, exclude=exclude):
+        settings = obj.stress_sculpt
+        if settings.role != "SUPPORT":
+            continue
+        fix = (bool(settings.fix_x), bool(settings.fix_y), bool(settings.fix_z))
+        if not any(fix):
+            continue
+        matrix = np.array(obj.matrix_world, dtype=np.float64)
+        supports.append(
+            {
+                "name": obj.name,
+                "position": matrix[:3, 3].copy(),
+                "fix": fix,
+                "parent": obj.parent.name if obj.parent is not None else "",
+            }
+        )
+    return supports
+
+
+def underside_contacts(verts, tris, points, directions) -> tuple:
+    """Where the structure carrying ``points`` meets the mesh ``verts`` / ``tris``.
+
+    For every point, the line through it along its force ``direction`` is
+    followed to the last surface it crosses (seen from far along ``direction``,
+    the first hit): a weight on top of an object is carried from its underside.
+    Points not over the mesh, or below it, keep their position. Returns
+    ``(contacts (P, 3), moved (P,) bool)``.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    dirs = np.asarray(directions, dtype=np.float64).reshape(-1, 3)
+    out = pts.copy()
+    moved = np.zeros(pts.shape[0], dtype=bool)
+    verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    tris = np.asarray(tris, dtype=np.int64).reshape(-1, 3)
+    if tris.shape[0] == 0 or pts.shape[0] == 0:
+        return out, moved
+    bmin, bmax = _mesh_bounds(verts, tris)
+    size = float(np.linalg.norm(bmax - bmin)) or 1.0
+    bvh = _bvh(verts, tris)
+    for i, (p, d) in enumerate(zip(pts, dirs)):
+        norm = float(np.linalg.norm(d))
+        if norm < 1e-12:
+            continue
+        d = d / norm
+        reach = size + float(np.linalg.norm(p - 0.5 * (bmin + bmax))) + 1.0
+        start = p + d * reach
+        location, _normal, _index, _dist = bvh.ray_cast(
+            Vector(start.tolist()), Vector((-d).tolist()), 2.0 * reach
+        )
+        if location is None:
+            continue
+        hit = np.array(location, dtype=np.float64)
+        along = float(np.dot(hit - p, d))
+        if along > 1e-6 * size:
+            out[i] = hit
+            moved[i] = True
+        elif along > -1e-6 * size:
+            out[i] = hit
+    return out, moved
+
+
+def voxelize_object(obj, depsgraph, grid) -> np.ndarray:
+    """``voxelize_mesh`` of an object's evaluated world mesh on ``grid``."""
+    verts, tris = evaluated_world_mesh(obj, depsgraph)
+    return voxelize_mesh(verts, tris, grid)
+
+
+def zone_fields(context, grid, domain_mask, exclude=(), method="RAY") -> tuple:
+    """Zone masks of the enabled zone objects on ``grid``.
+
+    Returns ``(passive_solid, passive_void, bias, branch, warnings)`` (``None``
+    for absent fields), restricted to ``domain_mask``.
+    """
+    depsgraph = context.evaluated_depsgraph_get()
+    warnings = []
+    centres_cache = []
+
+    def centres():
+        if not centres_cache:
+            centres_cache.append(grid.element_centers())
+        return centres_cache[0]
+
+    passive_solid = passive_void = bias = branch = None
+    for obj in role_objects(context, exclude=exclude):
+        role = obj.stress_sculpt.role
+        if role not in ZONE_ROLES:
+            continue
+        member = _zone_mask(obj, grid, depsgraph, method, centres, warnings) & domain_mask
+        if not member.any():
+            continue
+        strength = float(obj.stress_sculpt.strength)
+        if role == "KEEP_SOLID":
+            passive_solid = member if passive_solid is None else passive_solid | member
+        elif role == "KEEP_VOID":
+            passive_void = member if passive_void is None else passive_void | member
+        elif role in {"THICKEN", "HOLLOW"}:
+            if bias is None:
+                bias = np.zeros(grid.shape, dtype=np.float64)
+            bias[member] += strength if role == "THICKEN" else -strength
+        else:
+            if branch is None:
+                branch = np.zeros(grid.shape, dtype=np.float64)
+            branch[member] = np.maximum(branch[member], strength)
+    return passive_solid, passive_void, bias, branch, warnings
 
 
 # ------------------------------------------------------------------------ gather
-def gather_problem(context, settings=None) -> tuple:
+def gather_problem(context, settings=None, domain=None) -> tuple:
     """Build the ``Problem`` of the current scene (main thread).
+
+    ``domain`` overrides ``settings.domain`` (the Structure panel carves its
+    target this way without touching the analysis domain); the override object
+    never acts as a support / load / zone itself.
 
     Returns ``(problem, info)`` with ``info`` = ``{"warnings": [str],
     "loads": [(position, direction, magnitude)], "supports": [position],
@@ -419,7 +583,10 @@ def gather_problem(context, settings=None) -> tuple:
     fem = core_module("fem")
     warnings = []
 
-    domain = validated_domain(context, settings)
+    if domain is None:
+        domain = validated_domain(context, settings)
+    else:
+        domain = validated_mesh_object(context, domain, "object")
     depsgraph = context.evaluated_depsgraph_get()
     verts, tris = evaluated_world_mesh(domain, depsgraph)
     if tris.shape[0] == 0:
@@ -465,7 +632,7 @@ def gather_problem(context, settings=None) -> tuple:
     if getattr(domain.stress_sculpt, "role", "NONE") != "NONE":
         warnings.append(f"The domain '{domain.name}' has a role: the role is ignored")
 
-    for obj in role_objects(context):
+    for obj in role_objects(context, exclude=(domain,)):
         obj_settings = obj.stress_sculpt
         role = obj_settings.role
         matrix = np.array(obj.matrix_world, dtype=np.float64)

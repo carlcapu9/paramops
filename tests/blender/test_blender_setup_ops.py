@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 import bpy
-from bhelpers import box, bridge, require
+from bhelpers import CLASSIC_PRESETS, box, bridge, classic_setup, require
 
 from stress_sculpt import build, jobs, operators, scene_io
 
@@ -18,7 +18,13 @@ OPERATORS = (
     "add_zone",
     "set_role",
     "select_role",
+    "set_target",
+    "add_load_at_selection",
+    "add_support_at_selection",
+    "remove_role",
     "demo_scene",
+    "generate",
+    "verify",
     "analyze",
     "evolve",
     "trace_lines",
@@ -162,8 +168,8 @@ def test_set_domain(scene):
     assert not bpy.ops.stress_sculpt.set_domain.poll()
 
 
-@pytest.mark.parametrize("preset", ["BRIDGE", "CANTILEVER", "TOWER", "CHAIR"])
-def test_demo_presets_build_valid_setups(scene, preset):
+@pytest.mark.parametrize("preset", CLASSIC_PRESETS)
+def test_classic_setups_are_valid(scene, preset):
     require("fem")
     settings = bridge(resolution=16, preset=preset)
     domain = settings.domain
@@ -179,31 +185,24 @@ def test_demo_presets_build_valid_setups(scene, preset):
         assert tuple(domain.dimensions) == pytest.approx((4.0, 1.0, 1.5))
 
 
-def test_demo_rerun_replaces_previous_demo(scene):
-    bridge(resolution=16)
-    first = {o.name for o in scene.objects}
-    bridge(resolution=16, preset="TOWER")
-    assert len([o for o in scene.objects if o.stress_sculpt.role == "SUPPORT"]) == 1
-    assert len([o for o in scene.objects if o.stress_sculpt.role == "LOAD"]) == 2
-    assert scene.stress_sculpt.domain.dimensions.z == pytest.approx(4.0)
-    assert len([o for o in scene.objects if o.type == "MESH"]) == 1
-    assert "SS_Domain" in first
-
-
-def test_demo_fits_a_user_domain(scene):
+def test_classic_setup_fits_a_user_domain(scene):
     require("fem")
     mine = box("Mine", size=(6.0, 2.0, 2.0), location=(10.0, 0.0, 1.0))
-    scene.stress_sculpt.domain = mine
-    scene.stress_sculpt.resolution = 18
-    assert bpy.ops.stress_sculpt.demo_scene(preset="BRIDGE") == {"FINISHED"}
+    classic_setup("BRIDGE", resolution=18, domain=mine)
     assert scene.stress_sculpt.domain == mine and "SS_Domain" not in bpy.data.objects
     problem, info = scene_io.gather_problem(bpy.context)
     assert not info["warnings"]
     assert problem.forces.reshape(-1, 3).sum(axis=0)[2] == pytest.approx(-5000.0)
-    # running the demo again keeps the user's mesh and does not duplicate helpers
-    assert bpy.ops.stress_sculpt.demo_scene(preset="BRIDGE") == {"FINISHED"}
-    assert "Mine" in bpy.data.objects
-    assert len([o for o in scene.objects if o.stress_sculpt.role == "SUPPORT"]) == 2
+
+
+def test_gather_problem_domain_override(scene):
+    require("fem")
+    settings = bridge(resolution=16)
+    block = box("Block", size=(4.0, 1.0, 1.5), location=(0.0, 0.0, 0.75))
+    block.stress_sculpt.role = "SUPPORT"  # the override object never acts as a helper
+    problem, info = scene_io.gather_problem(bpy.context, domain=block)
+    assert info["domain_name"] == "Block" and settings.domain.name == "SS_Domain"
+    assert len(info["supports"]) == 2
 
 
 def test_cancel_poll_and_clear_results_without_results(scene):

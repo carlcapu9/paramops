@@ -1,7 +1,10 @@
 """Operators of Stress Sculpt (``bpy.ops.stress_sculpt.*``).
 
+* Structure (main flow): ``set_target``, ``add_load_at_selection``,
+  ``add_support_at_selection``, ``remove_role``, ``generate`` (threaded, live for
+  the organic style), ``verify``, ``demo_scene`` (architectural examples).
 * Setup: ``set_domain``, ``add_support``, ``add_load``, ``add_zone``, ``set_role``,
-  ``select_role``, ``demo_scene``.
+  ``select_role``.
 * Computation (threaded with live progress, Esc cancels): ``analyze``,
   ``evolve``, ``trace_lines``, ``sculpt``, ``relief``.
 * Housekeeping: ``cancel``, ``clear_results`` and the variants
@@ -20,13 +23,15 @@ import dataclasses
 import json
 import math
 
+import bmesh
 import bpy
 import numpy as np
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy.types import Operator
+from mathutils import Vector
 
 from . import build, jobs, scene_io
-from .core.grid import check_stop
+from .core.grid import Grid, Problem, check_stop
 from .jobs import RUNTIME, ThreadedOperatorMixin
 from .props import ROLE_ITEMS, ZONE_ROLES
 from .scene_io import core_module
@@ -126,6 +131,15 @@ def _format_stress(pascal) -> str:
         if value >= scale:
             return f"{pascal / scale:.3g} {unit}"
     return f"{pascal:.3g} Pa"
+
+
+def _format_force(newton) -> str:
+    value = abs(newton)
+    if value >= 1e6:
+        return f"{newton / 1e6:.3g} MN"
+    if value >= 1e3:
+        return f"{newton / 1e3:.3g} kN"
+    return f"{newton:.3g} N"
 
 
 def _format_length(meters) -> str:
@@ -797,307 +811,789 @@ class STRESS_SCULPT_OT_select_role(Operator):
         return {"FINISHED"}
 
 
-# ------------------------------------------------------------------ demo scenes
-DEMO_DOMAINS = {  # world box (min, max) of the demo domain, centred above the origin
-    "BRIDGE": ((-2.0, -0.5, 0.0), (2.0, 0.5, 1.5)),
-    "CANTILEVER": ((-2.0, -0.5, 0.0), (2.0, 0.5, 2.0)),
-    "TOWER": ((-0.6, -0.6, 0.0), (0.6, 0.6, 4.0)),
-    "CHAIR": ((-0.5, -0.5, 0.0), (0.5, 0.5, 2.0)),
-}
+# ----------------------------------------------------------- structure setup
+def _is_role_object(obj) -> bool:
+    settings = getattr(obj, "stress_sculpt", None)
+    return settings is not None and settings.role != "NONE"
 
 
-def _demo_specs(preset, bmin, bmax) -> list:
-    """Supports / loads / zones of a demo preset fitted to the box ``bmin``..``bmax``.
+class STRESS_SCULPT_OT_set_target(Operator):
+    bl_idname = "stress_sculpt.set_target"
+    bl_label = "Use Active Object"
+    bl_description = (
+        "Work with the active mesh: the object to hold up (Support Object) or the block to carve "
+        "the structure from (Carve Inside)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
 
-    Every entry: ``(name, role, display, location, rotation, scale, settings)``;
-    empties have display size 1, the region size comes from the scale.
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj is not None
+            and obj.type == "MESH"
+            and not _is_role_object(obj)
+            and not RUNTIME.busy()
+        )
+
+    def execute(self, context):
+        obj = context.active_object
+        if obj is None or obj.type != "MESH":
+            self.report({"ERROR"}, "Select the mesh to work with")
+            return {"CANCELLED"}
+        if _is_role_object(obj):
+            self.report(
+                {"ERROR"},
+                f"'{obj.name}' is a {obj.stress_sculpt.role.replace('_', ' ').title()} helper: "
+                "set its role to None first",
+            )
+            return {"CANCELLED"}
+        _settings(context).target = obj
+        self.report({"INFO"}, f"Object: {obj.name}")
+        return {"FINISHED"}
+
+
+def _selection_objects(context) -> list:
+    """Meshes whose selection the "at selection" operators read (active first)."""
+    active = context.active_object
+    if context.mode == "EDIT_MESH":
+        objects = [
+            obj
+            for obj in (getattr(context, "objects_in_mode_unique_data", None) or [])
+            if obj is not None and obj.type == "MESH"
+        ]
+        edit_object = getattr(context, "edit_object", None)
+        if not objects and edit_object is not None and edit_object.type == "MESH":
+            objects = [edit_object]
+        objects.sort(key=lambda o: o != active)
+        return objects
+    if active is not None and active.type == "MESH":
+        return [active]
+    return []
+
+
+def _world_linear(obj):
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    linear = matrix[:3, :3]
+    try:
+        normal_matrix = np.linalg.inv(linear).T
+    except np.linalg.LinAlgError:
+        normal_matrix = np.eye(3)
+    return matrix, linear, normal_matrix
+
+
+def _unit_rows(v) -> np.ndarray:
+    v = np.asarray(v, dtype=np.float64).reshape(-1, 3)
+    norm = np.linalg.norm(v, axis=1, keepdims=True)
+    return np.divide(v, norm, out=np.zeros_like(v), where=norm > 1e-30)
+
+
+def selection_points(obj, face_mode) -> dict:
+    """Selected vertices (or face centres) of a mesh in world space.
+
+    Reads the live Edit Mode selection (bmesh) or, in Object Mode, the selection
+    stored in the mesh. With ``face_mode`` and at least one selected face the
+    face centres are used (weights = world face areas); otherwise the selected
+    vertices (weights 1). Returns ``points (P, 3)``, ``normals (P, 3)`` (unit,
+    world), ``weights (P,)`` and ``faces`` (True when face centres were used).
     """
-    bmin = np.asarray(bmin, dtype=np.float64)
-    bmax = np.asarray(bmax, dtype=np.float64)
-    size = bmax - bmin
-    centre = 0.5 * (bmin + bmax)
-    longest = float(size.max())
-    down = (math.pi, 0.0, 0.0)
-    specs = []
-    if preset == "BRIDGE":
-        for side, fix_x in ((-1.0, True), (1.0, False)):
-            x = (bmin[0] + 0.05 * size[0]) if side < 0 else (bmax[0] - 0.05 * size[0])
-            specs.append(
-                (
-                    "SS_Support",
-                    "SUPPORT",
-                    "CUBE",
-                    (x, centre[1], bmin[2]),
-                    (0.0, 0.0, 0.0),
-                    (0.0625 * size[0], 0.6 * size[1], 0.1 * size[2]),
-                    {"fix_x": fix_x, "fix_y": True, "fix_z": True},
-                )
-            )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (centre[0], centre[1], bmax[2]),
-                down,
-                (0.15 * longest,) * 3,
-                {"magnitude": 5000.0, "load_radius": 0.06 * longest},
-            )
-        )
-    elif preset == "CANTILEVER":
-        specs.append(
-            (
-                "SS_Support",
-                "SUPPORT",
-                "CUBE",
-                (bmin[0], centre[1], centre[2]),
-                (0.0, 0.0, 0.0),
-                (0.04 * size[0], 0.6 * size[1], 0.6 * size[2]),
-                {"fix_x": True, "fix_y": True, "fix_z": True},
-            )
-        )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (bmax[0], centre[1], centre[2]),
-                down,
-                (0.15 * longest,) * 3,
-                {"magnitude": 5000.0, "load_radius": 0.06 * longest},
-            )
-        )
-    elif preset == "TOWER":
-        specs.append(
-            (
-                "SS_Support",
-                "SUPPORT",
-                "CUBE",
-                (centre[0], centre[1], bmin[2]),
-                (0.0, 0.0, 0.0),
-                (0.6 * size[0], 0.6 * size[1], 0.04 * size[2]),
-                {"fix_x": True, "fix_y": True, "fix_z": True},
-            )
-        )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (centre[0], centre[1], bmax[2]),
-                down,
-                (0.1 * longest,) * 3,
-                {"magnitude": 5000.0, "load_radius": 0.1 * longest},
-            )
-        )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (centre[0], centre[1], bmax[2] - 0.05 * size[2]),
-                (0.0, math.pi / 2.0, 0.0),
-                (0.1 * longest,) * 3,
-                {"magnitude": 2000.0, "load_radius": 0.1 * longest},
-            )
-        )
-    elif preset == "CHAIR":
-        for u in (0.08, 0.92):
-            for v in (0.08, 0.92):
-                specs.append(
-                    (
-                        "SS_Support",
-                        "SUPPORT",
-                        "CUBE",
-                        (bmin[0] + u * size[0], bmin[1] + v * size[1], bmin[2]),
-                        (0.0, 0.0, 0.0),
-                        (0.08 * size[0], 0.08 * size[1], 0.03 * size[2]),
-                        {"fix_x": True, "fix_y": True, "fix_z": True},
-                    )
-                )
-        seat = bmin[2] + 0.5 * size[2]
-        void_bottom = seat + 0.025 * size[2]
-        void_y1 = bmin[1] + 0.8 * size[1]
-        specs.append(
-            (  # room for the person: everything in front of the backrest above the seat
-                "SS_KeepVoid",
-                "KEEP_VOID",
-                "CUBE",
-                (
-                    centre[0],
-                    0.5 * (bmin[1] - 0.1 * size[1] + void_y1),
-                    0.5 * (void_bottom + bmax[2] + 0.05 * size[2]),
-                ),
-                (0.0, 0.0, 0.0),
-                (
-                    0.6 * size[0],
-                    0.5 * (void_y1 - bmin[1] + 0.1 * size[1]),
-                    0.5 * (bmax[2] + 0.05 * size[2] - void_bottom),
-                ),
-                {},
-            )
-        )
-        plate_bottom = seat - 0.06 * size[2]
-        specs.append(
-            (  # the seat plate stays solid (at least one voxel thick from resolution 16)
-                "SS_KeepSolid",
-                "KEEP_SOLID",
-                "CUBE",
-                (centre[0], 0.5 * (bmin[1] + void_y1), 0.5 * (plate_bottom + void_bottom)),
-                (0.0, 0.0, 0.0),
-                (0.5 * size[0], 0.5 * (void_y1 - bmin[1]), 0.5 * (void_bottom - plate_bottom)),
-                {},
-            )
-        )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (centre[0], bmin[1] + 0.4 * size[1], seat - 0.025 * size[2]),
-                down,
-                (0.15 * longest,) * 3,
-                {"magnitude": 1000.0, "load_radius": 0.05 * longest},
-            )
-        )
-        specs.append(
-            (
-                "SS_Load",
-                "LOAD",
-                "SINGLE_ARROW",
-                (centre[0], bmin[1] + 0.9 * size[1], bmin[2] + 0.85 * size[2]),
-                (-math.pi / 2.0, 0.0, 0.0),
-                (0.1 * longest,) * 3,
-                {"magnitude": 300.0, "load_radius": 0.05 * longest},
-            )
-        )
+    matrix, linear, normal_matrix = _world_linear(obj)
+    det = abs(float(np.linalg.det(linear)))
+    points = normals = weights = None
+    use_faces = False
+    if obj.mode == "EDIT":
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.normal_update()
+        if face_mode:
+            faces = [face for face in bm.faces if face.select]
+            if faces:
+                use_faces = True
+                points = np.array([tuple(f.calc_center_median()) for f in faces], dtype=np.float64)
+                normals = np.array([tuple(f.normal) for f in faces], dtype=np.float64)
+                weights = np.array([f.calc_area() for f in faces], dtype=np.float64)
+        if not use_faces:
+            verts = [vert for vert in bm.verts if vert.select]
+            points = np.array([tuple(v.co) for v in verts], dtype=np.float64).reshape(-1, 3)
+            normals = np.array([tuple(v.normal) for v in verts], dtype=np.float64).reshape(-1, 3)
+            weights = np.ones(points.shape[0], dtype=np.float64)
     else:
-        raise ValueError(f"Unknown demo preset '{preset}'")
-    return specs
+        mesh = obj.data
+        if face_mode and len(mesh.polygons):
+            n_polys = len(mesh.polygons)
+            selected = np.zeros(n_polys, dtype=bool)
+            mesh.polygons.foreach_get("select", selected)
+            if selected.any():
+                use_faces = True
+                centres = np.empty(n_polys * 3, dtype=np.float32)
+                face_normals = np.empty(n_polys * 3, dtype=np.float32)
+                areas = np.empty(n_polys, dtype=np.float32)
+                mesh.polygons.foreach_get("center", centres)
+                mesh.polygons.foreach_get("normal", face_normals)
+                mesh.polygons.foreach_get("area", areas)
+                points = centres.reshape(-1, 3)[selected].astype(np.float64)
+                normals = face_normals.reshape(-1, 3)[selected].astype(np.float64)
+                weights = areas[selected].astype(np.float64)
+        if not use_faces:
+            n_verts = len(mesh.vertices)
+            selected = np.zeros(n_verts, dtype=bool)
+            if n_verts:
+                mesh.vertices.foreach_get("select", selected)
+            co = build.mesh_vertices(mesh)
+            vertex_normals = np.zeros(n_verts * 3, dtype=np.float32)
+            if n_verts:
+                if hasattr(mesh, "vertex_normals"):  # Blender 4.1+
+                    mesh.vertex_normals.foreach_get("vector", vertex_normals)
+                else:
+                    mesh.vertices.foreach_get("normal", vertex_normals)
+            points = co[selected]
+            normals = vertex_normals.reshape(-1, 3)[selected].astype(np.float64)
+            weights = np.ones(points.shape[0], dtype=np.float64)
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    world_normals = _unit_rows(np.asarray(normals).reshape(-1, 3) @ normal_matrix.T)
+    if use_faces:
+        # area of a planar face under a linear map: det(A) * |A^-T n| * area
+        scale = det * np.linalg.norm(_unit_rows(normals) @ normal_matrix.T, axis=1)
+        weights = np.asarray(weights, dtype=np.float64) * scale
+    return {
+        "points": points @ linear.T + matrix[:3, 3],
+        "normals": world_normals,
+        "weights": np.maximum(np.asarray(weights, dtype=np.float64), 0.0),
+        "faces": use_faces,
+    }
 
 
-def _box_mesh(name, half):
-    """Closed box mesh centred on the origin with outward normals."""
-    hx, hy, hz = half
-    verts = np.array(
-        [
-            [-hx, -hy, -hz],
-            [hx, -hy, -hz],
-            [hx, hy, -hz],
-            [-hx, hy, -hz],
-            [-hx, -hy, hz],
-            [hx, -hy, hz],
-            [hx, hy, hz],
-            [-hx, hy, hz],
+def _object_diagonal(context, obj) -> float:
+    bounds = _world_bounds(context, obj)
+    if bounds is None:
+        return 1.0
+    diagonal = float(np.linalg.norm(bounds[1] - bounds[0]))
+    return diagonal if diagonal > 0.0 else 1.0
+
+
+def _rotation_to(direction):
+    """Euler rotation turning local +Z onto ``direction``."""
+    target = Vector(tuple(float(c) for c in direction))
+    if target.length < 1e-12:
+        return (0.0, 0.0, 0.0)
+    return tuple(Vector((0.0, 0.0, 1.0)).rotation_difference(target.normalized()).to_euler("XYZ"))
+
+
+def add_role_empties(context, parent, role, points, directions=None, magnitudes=None, size=1.0):
+    """LOAD (arrows along ``directions``) or SUPPORT empties at world ``points``.
+
+    Named ``SS_Load`` / ``SS_Support`` (Blender numbers them), colored, linked to
+    "StressSculpt Setup" and parented to ``parent`` (world transforms kept).
+    Returns the new objects.
+    """
+    scene = context.scene
+    created = []
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    for index, point in enumerate(points):
+        if role == "LOAD":
+            direction = directions[index]
+            obj = new_role_empty(
+                scene,
+                "SS_Load",
+                "LOAD",
+                "SINGLE_ARROW",
+                size,
+                point,
+                rotation=_rotation_to(direction),
+                color=build.LOAD_COLOR,
+            )
+            obj.stress_sculpt.magnitude = float(magnitudes[index])
+        else:
+            obj = new_role_empty(
+                scene, "SS_Support", "SUPPORT", "SPHERE", size, point, color=build.SUPPORT_COLOR
+            )
+            obj.stress_sculpt.fix_x = obj.stress_sculpt.fix_y = obj.stress_sculpt.fix_z = True
+        if parent is not None:
+            obj.parent = parent
+            obj.matrix_parent_inverse = parent.matrix_world.inverted()
+        created.append(obj)
+    return created
+
+
+def _selection_or_error(context, max_points=None) -> list:
+    """``[(object, selection_points dict)]`` for the selected points (ValueError if none)."""
+    tool = getattr(context, "tool_settings", None)
+    mode = tuple(tool.mesh_select_mode) if tool is not None else (True, False, False)
+    face_mode = bool(mode[2])
+    found = []
+    for obj in _selection_objects(context):
+        selection = selection_points(obj, face_mode)
+        if selection["points"].shape[0]:
+            found.append((obj, selection))
+    if not found:
+        raise ValueError(
+            "Nothing selected: in Edit Mode select the vertices or faces where the weight goes"
+        )
+    return found
+
+
+class _AtSelectionMixin:
+    @classmethod
+    def poll(cls, context):
+        if RUNTIME.busy():
+            return False
+        if context.mode == "EDIT_MESH":
+            return True
+        obj = context.active_object
+        return context.mode == "OBJECT" and obj is not None and obj.type == "MESH"
+
+
+class STRESS_SCULPT_OT_add_load_at_selection(_AtSelectionMixin, Operator):
+    bl_idname = "stress_sculpt.add_load_at_selection"
+    bl_label = "Put Weight on Selection"
+    bl_description = (
+        "Put a weight on every selected vertex (or selected face centre): the structure will "
+        "carry these points"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    force: FloatProperty(
+        name="Force",
+        default=1000.0,
+        min=0.0,
+        soft_max=1.0e6,
+        description="Weight in newtons, per point or in total",
+    )
+    distribute: EnumProperty(
+        name="Weight Is",
+        items=[
+            ("PER_POINT", "Per Point", "Every selected point carries the full force"),
+            ("TOTAL", "Total", "The force is shared by the points (by face area for faces)"),
         ],
-        dtype=np.float64,
+        default="PER_POINT",
     )
-    faces = np.array(
-        [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [2, 3, 7, 6], [0, 4, 7, 3], [1, 2, 6, 5]],
-        dtype=np.int64,
+    direction: EnumProperty(
+        name="Direction",
+        items=[
+            ("GRAVITY", "Gravity", "Straight down (world -Z)"),
+            ("INTO_SURFACE", "Into Surface", "Pressing into the surface (against the normal)"),
+        ],
+        default="GRAVITY",
     )
-    return build.mesh_from_faces(name, verts, faces, smooth=False)
+    max_points: IntProperty(
+        name="Max Points",
+        default=64,
+        min=1,
+        max=1024,
+        description="More selected points are merged into this many weights (force-weighted)",
+    )
+
+    def execute(self, context):
+        try:
+            found = _selection_or_error(context)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        forms = core_module("forms")
+        settings = _settings(context)
+        added = 0
+        total = 0.0
+        merged = 0
+        for obj, selection in found:
+            points, normals, weights = (
+                selection["points"],
+                selection["normals"],
+                selection["weights"],
+            )
+            n = points.shape[0]
+            if self.distribute == "TOTAL":
+                share = weights / weights.sum() if weights.sum() > 0.0 else np.full(n, 1.0 / n)
+                magnitudes = float(self.force) * share
+            else:
+                magnitudes = np.full(n, float(self.force))
+            if self.direction == "INTO_SURFACE":
+                directions = -normals
+                bad = np.linalg.norm(directions, axis=1) < 0.5
+                directions[bad] = (0.0, 0.0, -1.0)
+            else:
+                directions = np.tile([0.0, 0.0, -1.0], (n, 1))
+            forces = directions * magnitudes[:, None]
+            if n > int(self.max_points):
+                points, forces = forms.cluster_loads(points, forces, int(self.max_points))
+                merged += n - points.shape[0]
+            magnitudes = np.linalg.norm(forces, axis=1)
+            keep = magnitudes > 0.0
+            directions = forces[keep] / magnitudes[keep, None]
+            size = 0.08 * _object_diagonal(context, obj)
+            created = add_role_empties(
+                context, obj, "LOAD", points[keep], directions, magnitudes[keep], size
+            )
+            added += len(created)
+            total += float(magnitudes[keep].sum())
+        if settings.target is None:
+            settings.target = found[0][0]
+        if not added:
+            self.report({"WARNING"}, "No weight added: the force is 0")
+            return {"CANCELLED"}
+        message = f"Added {added} weight(s), total {_format_force(total)}"
+        if merged:
+            message += f" ({merged} nearby point(s) merged)"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+class STRESS_SCULPT_OT_add_support_at_selection(_AtSelectionMixin, Operator):
+    bl_idname = "stress_sculpt.add_support_at_selection"
+    bl_label = "Support at Selection"
+    bl_description = (
+        "Anchor the selected vertices (or face centres): where the block rests (Carve Inside) "
+        "or where the structure lands (Support Object)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    max_points: IntProperty(
+        name="Max Points",
+        default=64,
+        min=1,
+        max=1024,
+        description="More selected points are merged into this many supports",
+    )
+
+    def execute(self, context):
+        try:
+            found = _selection_or_error(context)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        forms = core_module("forms")
+        settings = _settings(context)
+        added = 0
+        on_target = False
+        for obj, selection in found:
+            points = selection["points"]
+            if points.shape[0] > int(self.max_points):
+                weights = np.maximum(selection["weights"], 1e-12)
+                points, _w = forms.cluster_loads(
+                    points, np.column_stack([np.zeros((points.shape[0], 2)), weights]),
+                    int(self.max_points),
+                )
+            bounds = _world_bounds(context, obj)
+            longest = float(np.max(bounds[1] - bounds[0])) if bounds is not None else 1.0
+            voxel = max(longest, 1e-6) / max(int(settings.resolution), 1)
+            size = max(1.5 * voxel, 0.03 * _object_diagonal(context, obj))
+            added += len(add_role_empties(context, obj, "SUPPORT", points, size=size))
+            on_target = on_target or (settings.target is not None and obj == settings.target)
+        if settings.target is None and settings.structure_mode == "CARVE":
+            settings.target = found[0][0]
+        if on_target and settings.structure_mode == "SUPPORT":
+            self.report(
+                {"WARNING"},
+                "These supports sit on the carried object: in Support Object mode footings go on "
+                "the ground (or another mesh) below the weights; use Carve Inside to anchor the "
+                "object itself",
+            )
+        self.report({"INFO"}, f"Added {added} support(s)")
+        return {"FINISHED"}
+
+
+class STRESS_SCULPT_OT_remove_role(Operator):
+    bl_idname = "stress_sculpt.remove_role"
+    bl_label = "Remove Helpers"
+    bl_description = (
+        "Delete every helper with this role (meshes are kept and just lose the role)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+
+    role: EnumProperty(name="Role", items=ROLE_ITEMS, default="LOAD")
+
+    @classmethod
+    def poll(cls, context):
+        return not RUNTIME.busy()
+
+    def execute(self, context):
+        if self.role == "NONE":
+            self.report({"ERROR"}, "Pick a role to remove")
+            return {"CANCELLED"}
+        scene = context.scene
+        empties, cleared = [], 0
+        for obj in list(scene.objects):
+            settings = getattr(obj, "stress_sculpt", None)
+            if settings is None or settings.role != self.role:
+                continue
+            if obj.type == "EMPTY":
+                empties.append(obj)
+            else:
+                settings.role = "NONE"
+                cleared += 1
+        removed = build.remove_objects(empties)
+        label = self.role.replace("_", " ").lower()
+        message = f"Removed {removed} {label} helper(s)"
+        if cleared:
+            message += f", {cleared} mesh(es) no longer {label}"
+        self.report({"INFO"}, message)
+        return {"FINISHED"}
+
+
+# ------------------------------------------------------------------ demo scenes
+def grid_box_mesh(name, size, divisions):
+    """Closed quad mesh of a box centred on the origin, every side split into a grid.
+
+    ``size`` (sx, sy, sz); ``divisions`` (nx, ny, nz) cells along each axis.
+    Outward normals; the sides share their border vertices (watertight).
+    """
+    n = [max(1, int(d)) for d in divisions]
+    axes = [np.linspace(-0.5 * s, 0.5 * s, d + 1) for s, d in zip(size, n)]
+    I, J, K = np.meshgrid(*(np.arange(d + 1) for d in n), indexing="ij")
+    surface = (I == 0) | (I == n[0]) | (J == 0) | (J == n[1]) | (K == 0) | (K == n[2])
+    index = -np.ones(I.shape, dtype=np.int64)
+    index[surface] = np.arange(int(surface.sum()))
+    verts = np.stack(
+        [axes[0][I[surface]], axes[1][J[surface]], axes[2][K[surface]]], axis=1
+    )
+    faces = []
+
+    def quads(a, b, fixed_axis, fixed, flip):
+        # grid of cells over axes (a, b) at index ``fixed`` of ``fixed_axis``
+        for u in range(n[a]):
+            for v in range(n[b]):
+                corners = []
+                for du, dv in ((0, 0), (1, 0), (1, 1), (0, 1)):
+                    ijk = [0, 0, 0]
+                    ijk[a], ijk[b], ijk[fixed_axis] = u + du, v + dv, fixed
+                    corners.append(index[tuple(ijk)])
+                faces.append(corners[::-1] if flip else corners)
+
+    quads(0, 1, 2, n[2], False)  # top (+Z)
+    quads(0, 1, 2, 0, True)  # bottom (-Z)
+    quads(1, 2, 0, n[0], False)  # +X
+    quads(1, 2, 0, 0, True)  # -X
+    quads(2, 0, 1, n[1], False)  # +Y
+    quads(2, 0, 1, 0, True)  # -Y
+    return build.mesh_from_faces(name, verts, np.asarray(faces, dtype=np.int64), smooth=False)
+
+
+def _face_centres(size, divisions, side) -> np.ndarray:
+    """Local centres of the grid cells on the top (+1) or bottom (-1) side of a grid box."""
+    nx, ny = int(divisions[0]), int(divisions[1])
+    xs = (np.arange(nx) + 0.5) / nx * size[0] - 0.5 * size[0]
+    ys = (np.arange(ny) + 0.5) / ny * size[1] - 0.5 * size[1]
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+    return np.stack([X.ravel(), Y.ravel(), np.full(X.size, 0.5 * side * size[2])], axis=1)
+
+
+# name, label, description, icon
+DEMO_ITEMS = [
+    (
+        "FLOATING_CUBE",
+        "Floating Cube",
+        "A cube held up by a branching tree column (weights on its bottom corners and edges)",
+        "MESH_CUBE",
+        0,
+    ),
+    (
+        "CANOPY",
+        "Canopy",
+        "A roof slab with 25 weights carried by organic columns on four footings",
+        "MOD_FLUIDSIM",
+        1,
+    ),
+    (
+        "PAVILION",
+        "Pavilion",
+        "A rotated floating volume on three footings, its supports covered with stress ribs",
+        "MOD_LATTICE",
+        2,
+    ),
+    (
+        "BRIDGE",
+        "Arch Bridge",
+        "A block resting on its two ends with weights along the top: an arch is carved out",
+        "MOD_SIMPLEDEFORM",
+        3,
+    ),
+    (
+        "CARVED_CUBE",
+        "Carved Cube",
+        "A cube on its four bottom corners, weighted at the top corners, carved into ribs",
+        "MOD_BOOLEAN",
+        4,
+    ),
+]
+
+
+def demo_layout(preset) -> dict:
+    """Object, weights, supports and settings of an architectural demo preset.
+
+    Returns ``size``, ``divisions``, ``location``, ``rotation_z``, ``loads``
+    (local points), ``force`` (N per weight), ``supports`` (local points),
+    ``settings`` (scene settings to apply).
+    """
+    if preset == "FLOATING_CUBE":
+        size = (2.0, 2.0, 2.0)
+        bottom = -1.0
+        loads = [(x, y, bottom) for x in (-1.0, 1.0) for y in (-1.0, 1.0)]
+        loads += [(0.0, -1.0, bottom), (0.0, 1.0, bottom), (-1.0, 0.0, bottom), (1.0, 0.0, bottom)]
+        return {
+            "name": "SS_Cube",
+            "size": size,
+            "divisions": (2, 2, 2),
+            "location": (0.0, 0.0, 4.0),
+            "rotation_z": 0.0,
+            "loads": np.array(loads),
+            "force": 2000.0,
+            "supports": np.zeros((0, 3)),
+            "settings": {
+                "structure_mode": "SUPPORT",
+                "structure_style": "BRANCHING",
+                "ground_height": 0.0,
+                "ground_contact": "FOOTINGS",
+                "footings": 0,
+                "resolution": 40,
+            },
+        }
+    if preset == "CANOPY":
+        size = (5.0, 5.0, 0.25)
+        return {
+            "name": "SS_Roof",
+            "size": size,
+            "divisions": (5, 5, 1),
+            "location": (0.0, 0.0, 3.2 + 0.125),
+            "rotation_z": 0.0,
+            "loads": _face_centres(size, (5, 5), +1),
+            "force": 800.0,
+            "supports": np.zeros((0, 3)),
+            "settings": {
+                "structure_mode": "SUPPORT",
+                "structure_style": "ORGANIC",
+                "ground_height": 0.0,
+                "ground_contact": "FOOTINGS",
+                "footings": 4,
+                "resolution": 48,
+                "max_iterations": 40,
+                "support_material": 0.06,
+                "filter_radius": 1.5,
+                "load_pad": 1.5,
+                "symmetry_x": True,
+                "symmetry_y": True,
+                "symmetry_z": False,
+            },
+        }
+    if preset == "PAVILION":
+        size = (4.0, 2.5, 1.0)
+        return {
+            "name": "SS_Pavilion",
+            "size": size,
+            "divisions": (4, 3, 1),
+            "location": (0.0, 0.0, 2.6 + 0.5),
+            "rotation_z": math.radians(15.0),
+            "loads": _face_centres(size, (4, 3), -1),
+            "force": 1500.0,
+            "supports": np.zeros((0, 3)),
+            "settings": {
+                "structure_mode": "SUPPORT",
+                "structure_style": "RIBS",
+                "ground_height": 0.0,
+                "ground_contact": "FOOTINGS",
+                "footings": 3,
+                "resolution": 44,
+                "max_iterations": 30,
+                "support_material": 0.07,
+                "filter_radius": 1.5,
+                "load_pad": 1.5,
+                "symmetry_x": False,
+                "symmetry_y": False,
+                "symmetry_z": False,
+            },
+        }
+    if preset == "BRIDGE":
+        size = (8.0, 1.2, 2.5)
+        xs = np.linspace(-3.6, 3.6, 9)
+        return {
+            "name": "SS_Block",
+            "size": size,
+            "divisions": (8, 1, 2),
+            "location": (0.0, 0.0, 1.25),
+            "rotation_z": 0.0,
+            "loads": np.stack([xs, np.zeros(9), np.full(9, 1.25)], axis=1),
+            "force": 3000.0,
+            "supports": np.array(
+                [[sx * 3.85, sy * 0.45, -1.25] for sx in (-1.0, 1.0) for sy in (-1.0, 1.0)]
+            ),
+            "settings": {
+                "structure_mode": "CARVE",
+                "structure_style": "ORGANIC",
+                "resolution": 56,
+                "max_iterations": 40,
+                "volume_fraction": 0.18,
+                "filter_radius": 1.5,
+                "symmetry_x": True,
+                "symmetry_y": True,
+                "symmetry_z": False,
+            },
+            "load_radius": 0.5,
+        }
+    if preset == "CARVED_CUBE":
+        size = (2.0, 2.0, 2.0)
+        return {
+            "name": "SS_Cube",
+            "size": size,
+            "divisions": (2, 2, 2),
+            "location": (0.0, 0.0, 1.0),
+            "rotation_z": 0.0,
+            "loads": np.array([(x, y, 1.0) for x in (-1.0, 1.0) for y in (-1.0, 1.0)]),
+            "force": 3000.0,
+            "supports": np.array([(x, y, -1.0) for x in (-1.0, 1.0) for y in (-1.0, 1.0)]),
+            "settings": {
+                "structure_mode": "CARVE",
+                "structure_style": "RIBS",
+                "rib_source": "SURFACE",
+                "resolution": 40,
+                "max_iterations": 30,
+                "volume_fraction": 0.25,
+                "filter_radius": 1.5,
+                "symmetry_x": True,
+                "symmetry_y": True,
+                "symmetry_z": False,
+            },
+        }
+    raise ValueError(f"Unknown demo preset '{preset}'")
+
+
+# Scene settings every demo resets (so presets do not inherit tweaks of the previous one).
+DEMO_DEFAULTS = (
+    "tree_branching",
+    "tree_split",
+    "tree_levels",
+    "tree_organic",
+    "tree_thickness",
+    "tree_min_thickness",
+    "tree_footing_flare",
+    "tree_capital_flare",
+    "tree_blend",
+    "tree_detail",
+    "rib_source",
+    "rib_spacing",
+    "rib_thickness",
+    "rib_min_thickness",
+    "rib_skin",
+    "line_families",
+    "sculpt_blend",
+    "smooth_iterations",
+    "iso_level",
+    "evo_mode",
+    "penalty",
+    "move_limit",
+    "min_change",
+    "live_update",
+    "load_pad",
+    "support_material",
+    "volume_fraction",
+    "filter_radius",
+    "max_iterations",
+    "symmetry_x",
+    "symmetry_y",
+    "symmetry_z",
+    "ground_height",
+    "ground_contact",
+    "footings",
+)
+
+
+def _reset_to_defaults(settings, names) -> None:
+    properties = settings.bl_rna.properties
+    for name in names:
+        prop = properties.get(name)
+        if prop is None or prop.is_readonly:
+            continue
+        try:
+            setattr(settings, name, prop.default)
+        except (TypeError, AttributeError, ValueError):
+            pass
 
 
 class STRESS_SCULPT_OT_demo_scene(Operator):
     bl_idname = "stress_sculpt.demo_scene"
-    bl_label = "Demo Scene"
+    bl_label = "Example"
     bl_description = (
-        "Build a ready-to-run example (domain, supports and loads). An existing domain of yours is "
-        "kept and the supports and loads are fitted to it"
+        "Build a ready-to-run architectural example (object, weights, supports and settings): "
+        "press Generate Structure"
     )
     bl_options = {"REGISTER", "UNDO"}
 
-    preset: EnumProperty(
-        name="Preset",
-        items=[
-            (
-                "BRIDGE",
-                "Bridge",
-                "Block resting on two supports, pressed down in the middle",
-                "MOD_SIMPLEDEFORM",
-                0,
-            ),
-            (
-                "CANTILEVER",
-                "Cantilever",
-                "Block fixed to a wall on one side, loaded at the free tip",
-                "MOD_LATTICE",
-                1,
-            ),
-            (
-                "TOWER",
-                "Tower",
-                "Tall block fixed at the base, loaded from above and from the side",
-                "MOD_BUILD",
-                2,
-            ),
-            (
-                "CHAIR",
-                "Chair",
-                "Seat and backrest loads on four feet, with a void zone for the sitter",
-                "OUTLINER_OB_POINTCLOUD",
-                3,
-            ),
-        ],
-        default="BRIDGE",
-    )
+    preset: EnumProperty(name="Example", items=DEMO_ITEMS, default="FLOATING_CUBE")
 
     def execute(self, context):
         if RUNTIME.busy():
             self.report({"ERROR"}, "Wait for the running job to finish (or cancel it)")
             return {"CANCELLED"}
+        try:
+            _ensure_object_mode(context)
+        except ValueError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         scene = context.scene
         settings = scene.stress_sculpt
-        domain = settings.domain
-        replace_domain = domain is None or domain.get(DEMO_TAG) is not None or domain.type != "MESH"
+        layout = demo_layout(self.preset)
 
-        # Remove what a previous demo created (keeping a user domain).
-        previous = [obj for obj in scene.objects if obj.get(DEMO_TAG) is not None and obj != domain]
-        if replace_domain and domain is not None and domain.get(DEMO_TAG) is not None:
-            previous.append(domain)
-        build.remove_objects(previous)
+        # A fresh example: earlier demo objects and the results go away.
+        build.remove_objects([obj for obj in scene.objects if obj.get(DEMO_TAG) is not None])
+        results = build.results_collection(scene, create=False)
+        if results is not None:
+            build.remove_objects(list(results.objects))
+        jobs.clear_cache(scene)
+        disabled = 0
+        for obj in scene_io.role_objects(context):
+            obj.stress_sculpt.enabled = False
+            disabled += 1
 
         setup = build.ensure_collection(scene, build.SETUP_COLLECTION)
-        if replace_domain:
-            bmin, bmax = (np.asarray(v, dtype=np.float64) for v in DEMO_DOMAINS[self.preset])
-            mesh = _box_mesh("SS_Domain", 0.5 * (bmax - bmin))
-            domain = bpy.data.objects.new("SS_Domain", mesh)
-            domain.location = tuple(0.5 * (bmin + bmax))
-            domain[DEMO_TAG] = self.preset
-            setup.objects.link(domain)
-            settings.domain = domain
-        else:
-            bounds = _world_bounds(context, domain)
-            if bounds is None:
-                self.report({"ERROR"}, f"The domain '{domain.name}' has no geometry")
-                return {"CANCELLED"}
-            bmin, bmax = bounds
+        mesh = grid_box_mesh(layout["name"], layout["size"], layout["divisions"])
+        target = bpy.data.objects.new(layout["name"], mesh)
+        target.location = layout["location"]
+        target.rotation_euler = (0.0, 0.0, layout["rotation_z"])
+        target[DEMO_TAG] = self.preset
+        setup.objects.link(target)
+        context.view_layer.update()
 
-        created = []
-        for name, role, display, location, rotation, scale, values in _demo_specs(
-            self.preset, bmin, bmax
-        ):
-            color = {"SUPPORT": build.SUPPORT_COLOR, "LOAD": build.LOAD_COLOR}.get(
-                role, ZONE_COLORS.get(role)
-            )
-            obj = new_role_empty(scene, name, role, display, 1.0, location, rotation, scale, color)
-            for key, value in values.items():
-                setattr(obj.stress_sculpt, key, value)
+        matrix = np.array(target.matrix_world, dtype=np.float64)
+        to_world = lambda local: local @ matrix[:3, :3].T + matrix[:3, 3]  # noqa: E731
+        loads = to_world(np.asarray(layout["loads"], dtype=np.float64).reshape(-1, 3))
+        diagonal = float(np.linalg.norm(layout["size"]))
+        created = add_role_empties(
+            context,
+            target,
+            "LOAD",
+            loads,
+            np.tile([0.0, 0.0, -1.0], (loads.shape[0], 1)),
+            np.full(loads.shape[0], layout["force"]),
+            0.08 * diagonal,
+        )
+        for obj in created:
+            obj.stress_sculpt.load_radius = float(layout.get("load_radius", 0.0))
+        supports = np.asarray(layout["supports"], dtype=np.float64).reshape(-1, 3)
+        if supports.shape[0]:
+            longest = float(max(layout["size"]))
+            voxel = longest / max(int(layout["settings"].get("resolution", 40)), 1)
+            size = max(1.5 * voxel, 0.03 * diagonal)
+            created += add_role_empties(context, target, "SUPPORT", to_world(supports), size=size)
+        for obj in created:
             obj[DEMO_TAG] = self.preset
-            created.append(obj)
 
-        view_layer = context.view_layer
+        _reset_to_defaults(settings, DEMO_DEFAULTS)
+        for key, value in layout["settings"].items():
+            setattr(settings, key, value)
+        settings.target = target
+        if settings.structure_mode == "CARVE":
+            settings.domain = target
+        elif settings.domain is not None and settings.domain.get(DEMO_TAG) is not None:
+            settings.domain = None
+        _set_last(scene, "")
+
         _deselect_all(context)
         try:
-            domain.select_set(True, view_layer=view_layer)
-            view_layer.objects.active = domain
+            target.select_set(True, view_layer=context.view_layer)
+            context.view_layer.objects.active = target
         except RuntimeError:
             pass
-        label = self.preset.title()
-        self.report(
-            {"INFO"}, f"Demo '{label}' ready ({len(created)} helpers): press Analyze or Evolve"
-        )
+        label = next(item[1] for item in DEMO_ITEMS if item[0] == self.preset)
+        message = f"Example '{label}' ready: press Generate Structure"
+        if disabled:
+            message += f" ({disabled} earlier helper(s) disabled)"
+        self.report({"INFO"}, message)
         return {"FINISHED"}
 
 
@@ -1238,6 +1734,31 @@ def _opt_settings(settings, topopt):
     )
 
 
+def run_optimizer(topopt, problem, opt_settings, progress, should_stop, on_state):
+    """Iterate ``topopt.Optimizer`` (worker side); ``on_state(state)`` after every iteration.
+
+    ``progress`` maps the iterations onto [0, 1]. The loop is bounded by
+    ``max_iter`` even if the optimizer never reports ``done``. Returns
+    ``(optimizer, last_state)`` (states are private copies).
+    """
+    optimizer = topopt.Optimizer(problem, opt_settings)
+    max_iter = max(1, int(opt_settings.max_iter))
+    progress(0.0, "Iteration 1: solving")
+    state = None
+    for _ in range(max_iter):
+        state = _copy_state(optimizer.step(should_stop=should_stop))
+        on_state(state)
+        progress(
+            min(state.iteration / max_iter, 1.0),
+            f"Iteration {state.iteration}/{max_iter}: material {state.volume * 100:.0f}%, "
+            f"change {state.change:.3f}",
+        )
+        if optimizer.done or state.converged or state.iteration >= max_iter:
+            break
+        check_stop(should_stop)
+    return optimizer, state
+
+
 def _max_displacement(optimizer, state, problem, opt_settings, should_stop):
     """Largest nodal displacement of the final design (one extra solve if not exposed)."""
     for name in ("u", "displacement", "_u"):
@@ -1294,26 +1815,21 @@ class STRESS_SCULPT_OT_evolve(ThreadedOperatorMixin, Operator):
     def compute(payload, progress, should_stop, emit):
         topopt, mesher = payload["modules"]["topopt"], payload["modules"]["mesher"]
         problem, opt_settings, params = payload["problem"], payload["opt"], payload["params"]
-        optimizer = topopt.Optimizer(problem, opt_settings)
-        max_iter = max(1, int(opt_settings.max_iter))
-        progress(0.0, "Iteration 1: solving")
-        snapshot = state = None
-        for _ in range(max_iter):  # bounded even if the optimizer never reports done
-            state = _copy_state(optimizer.step(should_stop=should_stop))
+        snapshots = []
+
+        def on_state(state):
             snapshot = {"payload": payload, "state": state, "preview": None}
             if payload["preview"]:
                 snapshot["preview"] = evolved_geometry(
                     state, problem, params, mesher, 2, clean=False
                 )
+            snapshots[:] = [snapshot]
             emit(snapshot)
-            progress(
-                min(state.iteration / max_iter, 1.0),
-                f"Iteration {state.iteration}/{max_iter}: material {state.volume * 100:.0f}%, "
-                f"change {state.change:.3f}",
-            )
-            if optimizer.done or state.converged or state.iteration >= max_iter:
-                break
-            check_stop(should_stop)
+
+        optimizer, state = run_optimizer(
+            topopt, problem, opt_settings, progress, should_stop, on_state
+        )
+        snapshot = snapshots[0]
         final = dict(snapshot)
         final["geometry"] = evolved_geometry(state, problem, params, mesher, params["smooth"])
         final["max_displacement"] = _max_displacement(
@@ -1834,6 +2350,2146 @@ class STRESS_SCULPT_OT_relief(ThreadedOperatorMixin, Operator):
         return {"FINISHED"}
 
 
+# ===================================================================== structure
+# "Generate Structure" (Structure panel): the target object is carried by a structure
+# growing from the ground (SUPPORT) or carved out of it (CARVE), in three styles:
+# ORGANIC (topology optimization), BRANCHING (form-found tree columns) and RIBS
+# (stress-line ribs over the optimized shape / the object's surface).
+KIND_ORGANIC = "ORGANIC"
+KIND_BRANCHING = "BRANCHING"
+KIND_RIBS = "RIBS"
+STRUCTURE_KINDS = (KIND_ORGANIC, KIND_BRANCHING, KIND_RIBS)
+KIND_LABELS.update({KIND_ORGANIC: "Organic", KIND_BRANCHING: "Branching", KIND_RIBS: "Ribs"})
+OBJECT_MAX_CELLS = 4_000_000  # fine voxelization of the object (flush contacts)
+OBJECT_MAX_SIDE = 160  # voxels along the longest side of that voxelization
+VERIFY_MAX_CELLS = 3_000_000  # grid of the structural check
+COMPONENT_KEEP = 0.03  # parts smaller than this share of the largest part are dropped
+ORGANIC_UPSAMPLE = 2  # the optimized density is meshed on a grid this much finer
+ORGANIC_BLUR = 2  # [1, 2, 1] passes over that finer grid (rounds the voxel facets)
+ORGANIC_OPENING = 0  # grey opening radius in fine voxels: removes webs thinner than that
+MEMBER_TAPER = 1.15  # a member ends at this times its thickest child's radius
+RIB_END_TAPER = 0.4  # open rib ends taper to this share of their radius ...
+RIB_END_SPAN = 0.1  # ... over this share of their length
+# ID properties stored on SS_Structure (read back by "Check Generated Structure")
+PROP_MODE = "ss_mode"
+PROP_STYLE = "ss_style"
+PROP_GROUND = "ss_ground"
+PROP_CONTACT = "ss_contact"
+PROP_FOOTINGS = "ss_footings"
+PROP_THINNEST = "ss_thinnest"
+PROP_PAD = "ss_pad"
+PROP_CONTACTS = "ss_contacts"  # where the structure meets each weight (flat xyz list)
+PROP_LOADS = "ss_loads"  # names of those weights, one per line
+
+
+# ------------------------------------------------------------ numeric (worker-safe)
+def _blur121(a) -> np.ndarray:
+    """Separable [1, 2, 1] / 4 blur with replicated borders (softens voxel indicators)."""
+    out = np.asarray(a, dtype=np.float64)
+    for axis in range(3):
+        n = out.shape[axis]
+        if n < 2:
+            continue
+        lower = np.take(out, np.r_[0, np.arange(n - 1)], axis=axis)
+        upper = np.take(out, np.r_[np.arange(1, n), n - 1], axis=axis)
+        out = 0.5 * out + 0.25 * (lower + upper)
+    return out
+
+
+def _erode6(mask) -> np.ndarray:
+    """Boolean erosion by the 6 face neighbours (outside the grid counts as empty)."""
+    return ~_dilate6(~np.pad(np.asarray(mask, dtype=bool), 1))[1:-1, 1:-1, 1:-1]
+
+
+def _dilate6(mask) -> np.ndarray:
+    out = np.asarray(mask, dtype=bool).copy()
+    src = out.copy()
+    for axis in range(3):
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[axis] = slice(0, -1)
+        hi[axis] = slice(1, None)
+        out[tuple(lo)] |= src[tuple(hi)]
+        out[tuple(hi)] |= src[tuple(lo)]
+    return out
+
+
+def _axis_centres(origin, h, n, axis) -> np.ndarray:
+    return float(origin[axis]) + (np.arange(n) + 0.5) * float(h)
+
+
+def clip_below(field, origin, h, height, iso) -> np.ndarray:
+    """Remove everything below the plane ``z = height`` (an exact flat cut).
+
+    ``min(field, iso + (z - height) / h)``: between the cell centres around the
+    plane the minimum crosses ``iso`` exactly at the plane wherever the field is
+    solid there.
+    """
+    z = _axis_centres(origin, h, field.shape[2], 2)
+    return np.minimum(field, (float(iso) + (z - float(height)) / float(h))[None, None, :])
+
+
+def indicator_on_grid(indicator, shape, origin, h, sculpt) -> np.ndarray:
+    """An indicator dict (``field`` 0..1, ``origin``, ``h``) resampled onto another grid."""
+    src = np.pad(np.asarray(indicator["field"], dtype=np.float64), 1)
+    src_h = float(indicator["h"])
+    src_origin = np.asarray(indicator["origin"], dtype=np.float64) - src_h
+    return sculpt.resample_to(src, src_origin, src_h, shape, origin, h)
+
+
+def clip_with_indicator(field, origin, h, indicator, keep_inside, iso, sculpt) -> np.ndarray:
+    """CSG with an object given by an indicator field (surface at 0.5).
+
+    ``keep_inside`` True keeps the part of ``field`` inside the object
+    (intersection: nothing leaves a carved block), False removes it
+    (difference: the structure stops flush at the object it carries).
+    """
+    t = indicator_on_grid(indicator, field.shape, origin, h, sculpt)
+    gain = 4.0
+    g = float(iso) + gain * ((t - 0.5) if keep_inside else (0.5 - t))
+    return np.minimum(field, g)
+
+
+def end_cuts(field, origin, h, ends, up, iso) -> np.ndarray:
+    """Flat member ends: cut by the plane through every end, perpendicular to ``up``.
+
+    ``ends`` = ``[(point, radius, side)]``; ``side`` +1 removes what lies above
+    the plane (load tips), -1 what lies below (footings). Only a cylinder of
+    about 1.6 radii around the end's axis is affected.
+    """
+    up = np.asarray(up, dtype=np.float64)
+    up = up / max(float(np.linalg.norm(up)), 1e-30)
+    origin = np.asarray(origin, dtype=np.float64)
+    shape = np.asarray(field.shape)
+    for point, radius, side in ends:
+        point = np.asarray(point, dtype=np.float64)
+        reach = 1.6 * float(radius) + 1.5 * h
+        lo = np.clip(np.floor((point - reach - origin) / h - 0.5).astype(np.int64), 0, shape)
+        hi = np.clip(np.ceil((point + reach - origin) / h - 0.5).astype(np.int64) + 1, 0, shape)
+        if np.any(hi <= lo):
+            continue
+        axes = [_axis_centres(origin, h, shape[a], a)[lo[a] : hi[a]] for a in range(3)]
+        rel = np.stack(np.meshgrid(*axes, indexing="ij"), axis=-1) - point
+        along = rel @ up
+        radial = np.linalg.norm(rel - along[..., None] * up, axis=-1)
+        cut = np.where(radial <= reach, float(iso) - float(side) * along / h, np.inf)
+        block = tuple(slice(lo[a], hi[a]) for a in range(3))
+        field[block] = np.minimum(field[block], cut)
+    return field
+
+
+def face_components(n_verts, faces) -> np.ndarray:
+    """Connected component label (smallest vertex id of the part) of every face."""
+    faces = np.asarray(faces, dtype=np.int64)
+    parent = np.arange(int(n_verts), dtype=np.int64)
+    if faces.size == 0:
+        return np.zeros(0, dtype=np.int64)
+    u = np.repeat(faces[:, 0], faces.shape[1] - 1)
+    v = faces[:, 1:].ravel()
+    while True:
+        pu, pv = parent[u], parent[v]
+        diff = pu != pv
+        if not diff.any():
+            break
+        np.minimum.at(parent, np.maximum(pu[diff], pv[diff]), np.minimum(pu[diff], pv[diff]))
+        while True:
+            jumped = parent[parent]
+            if np.array_equal(jumped, parent):
+                break
+            parent = jumped
+    return parent[faces[:, 0]]
+
+
+def drop_minor_parts(verts, faces, keep=COMPONENT_KEEP) -> tuple:
+    """Remove parts smaller than ``keep`` x the largest part (floating crumbs)."""
+    verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    faces = np.asarray(faces, dtype=np.int64)
+    if faces.shape[0] == 0:
+        return verts[:0], faces
+    labels = face_components(verts.shape[0], faces)
+    sizes = np.bincount(labels, minlength=verts.shape[0])
+    kept = sizes[labels] >= max(1.0, float(keep) * float(sizes.max()))
+    faces = faces[kept]
+    used = np.zeros(verts.shape[0], dtype=bool)
+    used[faces.ravel()] = True
+    remap = np.cumsum(used) - 1
+    return verts[used], remap[faces]
+
+
+def keep_grounded(verts, faces, anchors) -> tuple:
+    """Keep the parts that touch a support: nothing floats.
+
+    ``anchors`` = dict ``points`` (S, 3) with ``radius`` and/or ``floor`` (a part
+    reaching ``z <= floor`` stands on the ground). When no part touches (a
+    degenerate setup) the input is returned unchanged.
+    """
+    if anchors is None or faces.shape[0] == 0:
+        return verts, faces
+    labels = face_components(verts.shape[0], faces)
+    vertex_label = np.full(verts.shape[0], -1, dtype=np.int64)
+    vertex_label[faces.ravel()] = np.repeat(labels, faces.shape[1])
+    touching = np.zeros(verts.shape[0], dtype=bool)
+    floor = anchors.get("floor")
+    if floor is not None:
+        touching |= verts[:, 2] <= float(floor)
+    points = np.asarray(anchors.get("points", np.zeros((0, 3))), dtype=np.float64).reshape(-1, 3)
+    radius = float(anchors.get("radius", 0.0))
+    for point in points:
+        touching |= np.linalg.norm(verts - point, axis=1) <= radius
+    grounded = np.unique(vertex_label[touching & (vertex_label >= 0)])
+    if grounded.size == 0:
+        return verts, faces
+    kept = np.isin(labels, grounded)
+    if kept.all():
+        return verts, faces
+    faces = faces[kept]
+    used = np.zeros(verts.shape[0], dtype=bool)
+    used[faces.ravel()] = True
+    remap = np.cumsum(used) - 1
+    return verts[used], remap[faces]
+
+
+def structure_surface(raw, clipped, origin, h, iso, smooth, mesher, anchors=None,
+                      planes=()) -> tuple:
+    """Mesh of ``clipped`` at ``iso``: crumbs and floating parts removed, smoothed.
+
+    Vertices on cut faces (where ``clipped`` is below the unclipped ``raw``
+    field: flush contacts, flat footings) are pinned so the cuts stay planar;
+    the ones within a voxel of a horizontal cut in ``planes`` (heights) are
+    snapped onto it. ``anchors``: see :func:`keep_grounded`.
+    """
+    verts, faces = mesher.surface_nets(clipped, iso, origin, h)
+    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 4)
+    if faces.shape[0] == 0:
+        return np.zeros((0, 3)), faces
+    verts, faces = drop_minor_parts(verts, faces)
+    verts, faces = keep_grounded(np.asarray(verts, dtype=np.float64), faces, anchors)
+    pinned = None
+    if raw is not None and faces.shape[0]:
+        cut = np.asarray(mesher.sample_trilinear(raw - clipped, origin, h, verts), dtype=np.float64)
+        pinned = cut > 0.04
+        verts = np.array(verts, dtype=np.float64)
+        for height in planes:
+            if height is None:
+                continue
+            snap = pinned & (np.abs(verts[:, 2] - float(height)) < 0.75 * h)
+            verts[snap, 2] = float(height)
+        if not pinned.any() or pinned.all():
+            pinned = None
+    if smooth > 0 and faces.shape[0]:
+        verts = mesher.taubin_smooth(verts, faces, iterations=int(smooth), pinned=pinned)
+    return np.asarray(verts, dtype=np.float64), faces
+
+
+def _colored(verts, faces, values, colormap, clip, mesher, signed=False) -> dict:
+    values = np.asarray(values, dtype=np.float64)
+    lo, hi = color_range(values, signed, colormap, clip)
+    return {
+        "verts": verts,
+        "faces": faces,
+        "colors": mesher.colormap(values, lo, hi, name=colormap),
+        "values": values,
+    }
+
+
+def _empty_geometry() -> dict:
+    return {
+        "verts": np.zeros((0, 3)),
+        "faces": np.zeros((0, 4), dtype=np.int64),
+        "colors": np.zeros((0, 4)),
+        "values": np.zeros(0),
+    }
+
+
+def unreached_points(points, verts, distance) -> np.ndarray:
+    """Indices of ``points`` farther than ``distance`` from every mesh vertex."""
+    points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    if verts.shape[0] == 0:
+        return np.arange(points.shape[0])
+    far = []
+    for index, point in enumerate(points):
+        if float(np.min(np.linalg.norm(verts - point, axis=1))) > distance:
+            far.append(index)
+    return np.asarray(far, dtype=np.int64)
+
+
+def _array_digest(*items) -> str:
+    """Hash of arrays / plain values (cache signatures)."""
+    import hashlib
+
+    digest = hashlib.blake2b(digest_size=16)
+    for item in items:
+        if isinstance(item, np.ndarray):
+            digest.update(repr((item.dtype.str, item.shape)).encode())
+            digest.update(np.ascontiguousarray(item).tobytes())
+        elif item is None:
+            digest.update(b"none")
+        else:
+            digest.update(repr(item).encode())
+    return digest.hexdigest()
+
+
+def problem_digest(problem, opt_settings) -> str:
+    grid = problem.grid
+    return _array_digest(
+        "organic-1",
+        grid.shape,
+        grid.origin,
+        grid.h,
+        problem.domain,
+        problem.fixed_dofs,
+        problem.forces,
+        problem.passive_solid,
+        problem.passive_void,
+        problem.bias,
+        problem.E,
+        problem.nu,
+        repr(opt_settings),
+    )
+
+
+# --------------------------------------------------------------------- footprint
+def _bilinear_mask(mask, origin2, h2, points) -> np.ndarray:
+    """Bilinear sample of a 2D 0/1 mask at ``points (P, 2)`` (0 outside the mask grid)."""
+    padded = np.pad(np.asarray(mask, dtype=np.float64), 1)
+    u = (np.asarray(points, dtype=np.float64) - origin2) / h2 + 0.5
+    i0 = np.floor(u).astype(np.int64)
+    frac = u - i0
+    out = np.zeros(u.shape[0], dtype=np.float64)
+    nx, ny = padded.shape
+    for di in (0, 1):
+        for dj in (0, 1):
+            ii = np.clip(i0[:, 0] + di, 0, nx - 1)
+            jj = np.clip(i0[:, 1] + dj, 0, ny - 1)
+            w = (frac[:, 0] if di else 1.0 - frac[:, 0]) * (frac[:, 1] if dj else 1.0 - frac[:, 1])
+            out += w * padded[ii, jj]
+    return out
+
+
+def inset_contacts(points, radii, footprint, margin=1.08, n_ring=24) -> np.ndarray:
+    """Slide contact points towards the footprint centre until their disc fits under it.
+
+    ``footprint`` = dict ``mask`` (nx, ny) bool, ``origin`` (2,), ``h``: the
+    object's plan (optionally ``under`` (P,) bool: which points sit on the
+    object's underside; the others are left alone). A member ending at a corner
+    or an edge of the object would otherwise stick out beside it; now its
+    capital (``radius`` x ``margin``) lies fully under the object. Points move by
+    at most three radii; points whose disc never fits stay put.
+    """
+    pts = np.array(points, dtype=np.float64).reshape(-1, 3)
+    mask = np.asarray(footprint["mask"], dtype=bool)
+    if not mask.any():
+        return pts
+    under = footprint.get("under")
+    under = np.ones(pts.shape[0], dtype=bool) if under is None else np.asarray(under, bool)
+    origin2 = np.asarray(footprint["origin"], dtype=np.float64)[:2]
+    h2 = float(footprint["h"])
+    ii, jj = np.nonzero(mask)
+    centre = origin2 + (np.stack([ii, jj], axis=1).mean(axis=0) + 0.5) * h2
+    theta = np.linspace(0.0, 2.0 * math.pi, n_ring, endpoint=False)
+    ring = np.stack([np.cos(theta), np.sin(theta)], axis=1)
+    for index in range(pts.shape[0]):
+        if not under[index]:
+            continue
+        start = pts[index, :2].copy()
+        radius = float(radii[index]) * margin
+        towards = centre - start
+        length = float(np.linalg.norm(towards))
+        if length > 1e-12:
+            towards /= length
+        length = min(length, 3.0 * radius)
+        steps = np.arange(0.0, length + 1e-9, 0.25 * h2) if length > 1e-12 else np.zeros(1)
+        for t in steps:
+            q = start + towards * t
+            probe = np.vstack([q[None, :], q + radius * ring])
+            if np.all(_bilinear_mask(mask, origin2, h2, probe) >= 0.5 - 1e-9):
+                pts[index, :2] = q
+                break
+    return pts
+
+
+# ------------------------------------------------------------------------ trees
+def tree_settings(forms, params, radius_max):
+    return forms.TreeSettings(
+        n_trunks=int(params["footings"]),
+        branching=int(params["branching"]),
+        split_height=float(params["split"]),
+        level_curve=float(params["levels"]),
+        organic=float(params["organic"]),
+        radius_min=float(params["min_thickness"]) * radius_max,
+        radius_max=radius_max,
+        footing_flare=float(params["footing_flare"]),
+        capital_flare=float(params["capital_flare"]),
+        samples=16,
+    )
+
+
+def taper_members(tree, end_ratio=MEMBER_TAPER, start=0.55) -> list:
+    """Member radii along their curves, tapering into the branches they split into.
+
+    A member ending at a split narrows (smoothstep over its last 45%) to
+    ``end_ratio`` x its thickest child's radius: the fork grows out of the trunk
+    instead of sitting on a shoulder.
+    """
+    children = {}
+    for e, (a, _b) in enumerate(tree.edges):
+        children.setdefault(int(a), []).append(e)
+    radii = [np.array(r, dtype=np.float64) for r in tree.curve_radii]
+    for e, (_a, b) in enumerate(tree.edges):
+        kids = children.get(int(b))
+        if tree.kind[b] != 1 or not kids:
+            continue
+        r = radii[e]
+        target = min(float(r[-1]), end_ratio * max(float(radii[k][0]) for k in kids))
+        s = np.linspace(0.0, 1.0, r.size)
+        w = np.clip((s - start) / (1.0 - start), 0.0, 1.0)
+        w = w * w * (3.0 - 2.0 * w)
+        radii[e] = r * (1.0 - w) + target * w
+    return radii
+
+
+def leaf_radii(tree, points) -> np.ndarray:
+    """Capital radius of the member reaching each of ``points`` (nearest leaf)."""
+    leaf_edge = {int(b): e for e, (_a, b) in enumerate(tree.edges) if tree.kind[b] == 2}
+    leaves = np.array(sorted(leaf_edge), dtype=np.int64)
+    out = np.zeros(len(points))
+    for i, point in enumerate(np.asarray(points, dtype=np.float64)):
+        nearest = int(leaves[np.argmin(np.linalg.norm(tree.nodes[leaves] - point, axis=1))])
+        out[i] = float(np.max(tree.curve_radii[leaf_edge[nearest]]))
+    return out
+
+
+def tree_ends(tree, radii) -> list:
+    """``(point, radius, side)`` of every load tip (+1) and footing (-1) of a tree."""
+    ends = []
+    for e, (a, b) in enumerate(tree.edges):
+        if tree.kind[b] == 2:
+            ends.append((tree.nodes[b], float(radii[e][-1]), 1.0))
+        if tree.kind[a] == 0:
+            ends.append((tree.nodes[a], float(radii[e][0]), -1.0))
+    return ends
+
+
+def nearest_inside(domain, grid):
+    """``constrain`` callable for ``grow_tree``: points outside ``domain`` move to the
+    nearest domain element centre."""
+    centres = grid.element_centers()[domain]
+    shape = np.asarray(grid.shape)
+
+    def constrain(points):
+        pts = np.array(points, dtype=np.float64).reshape(-1, 3)
+        if centres.shape[0] == 0:
+            return pts
+        ijk = np.floor((pts - grid.origin) / grid.h).astype(np.int64)
+        ok = np.all((ijk >= 0) & (ijk < shape), axis=1)
+        inside = np.zeros(pts.shape[0], dtype=bool)
+        inside[ok] = domain[ijk[ok, 0], ijk[ok, 1], ijk[ok, 2]]
+        for i in np.flatnonzero(~inside):
+            pts[i] = centres[int(np.argmin(np.linalg.norm(centres - pts[i], axis=1)))]
+        return pts
+
+    return constrain
+
+
+def _cap_voxel(voxel, bmin, bmax, max_cells, warnings, what) -> float:
+    extent = np.maximum(np.asarray(bmax) - np.asarray(bmin), voxel)
+    cells = float(np.prod(np.ceil(extent / voxel) + 4))
+    if cells > max_cells:
+        voxel *= (cells / max_cells) ** (1.0 / 3.0)
+        warnings.append(f"{what} was coarsened to stay within memory: lower Detail")
+    return voxel
+
+
+def branching_geometry(payload, progress, should_stop) -> dict:
+    """Worker: form-found tree(s) -> tube field -> clipped, smoothed mesh."""
+    modules = payload["modules"]
+    forms, sculpt, mesher = modules["forms"], modules["sculpt"], modules["mesher"]
+    job = payload["branching"]
+    params = payload["params"]
+    warnings = []
+    points = np.asarray(job["points"], dtype=np.float64)
+    forces = np.asarray(job["forces"], dtype=np.float64)
+    settings = tree_settings(forms, job["tree"], job["radius_max"])
+    supports = job["supports"]
+    constrain = job.get("constrain")
+    progress(0.02, "Growing the tree")
+
+    def grow(pts):
+        return forms.grow_tree(
+            pts,
+            forces,
+            settings,
+            supports=supports,
+            ground=job["ground"],
+            constrain=constrain,
+            should_stop=should_stop,
+        )
+
+    try:
+        tree = grow(points)
+        footprint = job.get("footprint")
+        if footprint is not None and points.shape[0] <= settings.max_leaves:
+            inset = inset_contacts(points, leaf_radii(tree, points), footprint)
+            if np.any(np.abs(inset - points) > 1e-9):
+                points = inset
+                tree = grow(points)
+    except ValueError as exc:
+        raise ValueError(f"No tree fits these weights and supports: {exc}") from exc
+    warnings.extend(tree.warnings)
+    check_stop(should_stop)
+
+    radii = taper_members(tree)
+    tubes = [
+        sculpt.Tube(points=curve, radius=r, value=np.full(curve.shape[0], float(force)))
+        for curve, r, force in zip(tree.curves, radii, tree.forces)
+    ]
+    thinnest = min(float(np.min(r)) for r in radii)
+    voxel = thinnest / max(float(job["detail"]), 1e-3)
+    all_points = np.concatenate([np.asarray(t.points) for t in tubes])
+    reach = 3.0 * max(float(np.max(r)) for r in radii)
+    voxel = _cap_voxel(
+        voxel,
+        all_points.min(axis=0) - reach,
+        all_points.max(axis=0) + reach,
+        SCULPT_MAX_CELLS,
+        warnings,
+        "The structure surface",
+    )
+    progress(0.08, "Shaping the members")
+    field, origin, h, values = sculpt.tubes_field(
+        tubes,
+        voxel,
+        blend=float(job["blend"]),
+        progress=_sub_progress(progress, 0.08, 0.6),
+        should_stop=should_stop,
+    )
+    field = np.asarray(field, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    check_stop(should_stop)
+    progress(0.62, "Cutting the contacts")
+    iso = sculpt.TUBE_ISO
+    clipped = field.copy()
+    if payload["mode"] == "SUPPORT":
+        bases = tree.nodes[tree.kind == 0]
+        floor = min(float(job["ground"]), float(bases[:, 2].min()) if bases.size else 0.0)
+        clipped = clip_below(clipped, origin, h, floor, iso)
+        clipped = end_cuts(clipped, origin, h, tree_ends(tree, radii), tree.up, iso)
+        if payload.get("object") is not None:
+            clipped = clip_with_indicator(clipped, origin, h, payload["object"], False, iso, sculpt)
+    elif payload.get("object") is not None:
+        clipped = clip_with_indicator(clipped, origin, h, payload["object"], True, iso, sculpt)
+    check_stop(should_stop)
+    progress(0.7, "Building the surface")
+    planes = ()
+    if payload["mode"] == "SUPPORT":
+        tips = tree.nodes[tree.kind == 2]
+        planes = (floor,) + tuple(np.unique(np.round(tips[:, 2], 9))) if abs(
+            float(tree.up[2])) > 0.999 else (floor,)
+    bases = tree.nodes[tree.kind == 0]
+    base_radius = max((float(r[0]) for r in radii), default=h)
+    anchors = {"points": bases, "radius": 3.0 * base_radius + 2.0 * h}
+    if payload["mode"] == "SUPPORT":
+        anchors["floor"] = floor + 0.75 * h
+    verts, faces = structure_surface(
+        field, clipped, origin, h, iso, params["smooth"], mesher, anchors, planes
+    )
+    del field, clipped
+    if faces.shape[0] == 0:
+        raise ValueError("The structure came out empty: raise Thickness or Detail")
+    progress(0.92, "Coloring")
+    vertex_values = sample_field(values, values > 0.0, _GridLike(origin, h), verts, mesher)
+    geometry = _colored(verts, faces, vertex_values, params["colormap"], params["clip"], mesher)
+    stress = tree.forces / (math.pi * np.maximum(tree.radii, 1e-9) ** 2)
+    progress(1.0, "Done")
+    return {
+        "geometry": geometry,
+        "warnings": warnings,
+        "contacts": points,
+        "footings": tree.nodes[tree.kind == 0],
+        "thinnest": thinnest,
+        "metrics": {
+            "max_stress": float(np.max(stress)) if stress.size else 0.0,
+            "members": int(tree.edges.shape[0]),
+            "footings": int((tree.kind == 0).sum()),
+            "total_load": float(tree.total_load),
+        },
+    }
+
+
+# ---------------------------------------------------------------------- organic
+def structure_anchors(payload, h) -> dict:
+    """Where the structure may touch its supports (see :func:`keep_grounded`)."""
+    pad = float(payload.get("pad") or 0.0)
+    footings = payload.get("footings")
+    points = np.zeros((0, 3)) if footings is None else np.asarray(footings, dtype=np.float64)
+    radius = max(2.0 * pad, 3.0 * float(h))
+    if payload["mode"] == "SUPPORT":
+        return {"points": points, "radius": radius, "floor": float(payload["floor"]) + 0.75 * h}
+    return {"points": points, "radius": radius}
+
+
+def support_planes(payload) -> tuple:
+    """Heights of the flat cuts of a SUPPORT structure (floor and top)."""
+    if payload["mode"] != "SUPPORT":
+        return ()
+    return (float(payload["floor"]), payload.get("top"))
+
+
+def support_clips(field, origin, h, iso, payload, sculpt) -> np.ndarray:
+    """Copy of ``field`` cut to the room the structure may use.
+
+    SUPPORT: nothing below the floor, nothing above the highest contact and
+    nothing inside the carried object (flush contacts). CARVE: nothing outside
+    the block.
+    """
+    clipped = np.array(field, dtype=np.float64, copy=True)
+    obj = payload.get("object")
+    if payload["mode"] == "SUPPORT":
+        clipped = clip_below(clipped, origin, h, float(payload["floor"]), iso)
+        top = payload.get("top")
+        if top is not None:  # mirror image of clip_below: cut above the plane
+            z = _axis_centres(origin, h, clipped.shape[2], 2)
+            np.minimum(clipped, (float(iso) - (z - float(top)) / float(h))[None, None, :],
+                       out=clipped)
+        if obj is not None:
+            clipped = clip_with_indicator(clipped, origin, h, obj, False, iso, sculpt)
+    elif obj is not None:
+        clipped = clip_with_indicator(clipped, origin, h, obj, True, iso, sculpt)
+    return clipped
+
+
+def _box_filter(a, op, passes) -> np.ndarray:
+    """``passes`` separable 3x3x3 min / max filters (grey erosion / dilation)."""
+    out = np.asarray(a, dtype=np.float64)
+    for _ in range(int(passes)):
+        for axis in range(3):
+            n = out.shape[axis]
+            if n < 2:
+                continue
+            lower = np.take(out, np.r_[0, np.arange(n - 1)], axis=axis)
+            upper = np.take(out, np.r_[np.arange(1, n), n - 1], axis=axis)
+            out = op(out, op(lower, upper))
+    return out
+
+
+def organic_field(state, problem, mode, upsample=ORGANIC_UPSAMPLE, sculpt=None) -> tuple:
+    """Optimized density on a finer grid, padded for flush cuts.
+
+    SUPPORT: zeros around the design box except below the ground, where the
+    bottom layer continues (cut flat later). CARVE: borders replicated (the block
+    clip trims them flush with the block faces). Returns ``(field, origin, h)``.
+    """
+    grid = problem.grid
+    density = np.where(problem.domain, np.asarray(state.density, dtype=np.float64), 0.0)
+    if mode == "SUPPORT":
+        padded = np.pad(density, 1)
+        padded[1:-1, 1:-1, 0] = density[:, :, 0]
+    else:
+        padded = np.pad(density, 1, mode="edge")
+    origin = grid.origin - grid.h
+    if upsample <= 1 or sculpt is None:
+        return padded, origin, grid.h
+    fine_h = grid.h / float(upsample)
+    shape = tuple(int(n) * int(upsample) for n in padded.shape)
+    fine = sculpt.resample_to(padded, origin, grid.h, shape, origin, fine_h)
+    if ORGANIC_OPENING > 0:
+        fine = _box_filter(_box_filter(fine, np.minimum, ORGANIC_OPENING), np.maximum,
+                           ORGANIC_OPENING)
+    for _ in range(max(0, int(ORGANIC_BLUR))):
+        fine = _blur121(fine)
+    return fine, origin, fine_h
+
+
+def organic_geometry(state, problem, payload, smooth, progress=None, should_stop=None) -> dict:
+    """Final mesh of an optimized density: finer grid, flush cuts, smoothing, colors."""
+    modules = payload["modules"]
+    sculpt, mesher = modules["sculpt"], modules["mesher"]
+    params = payload["params"]
+    iso = float(params["iso"])
+    mode = payload["mode"]
+    field, origin, h = organic_field(state, problem, mode, ORGANIC_UPSAMPLE, sculpt)
+    check_stop(should_stop)
+    clipped = support_clips(field, origin, h, iso, payload, sculpt)
+    check_stop(should_stop)
+    verts, faces = structure_surface(
+        field,
+        clipped,
+        origin,
+        h,
+        iso,
+        smooth,
+        mesher,
+        structure_anchors(payload, h),
+        support_planes(payload),
+    )
+    if faces.shape[0] == 0:
+        return _empty_geometry()
+    grid = problem.grid
+    density = np.where(problem.domain, np.asarray(state.density, dtype=np.float64), 0.0)
+    solid = (density >= iso) & problem.domain
+    if not solid.any():
+        solid = problem.domain
+    von_mises = np.asarray(state.von_mises, dtype=np.float64)
+    values = sample_field(von_mises, solid, grid, verts, mesher)
+    lo, hi = color_range(von_mises[solid], False, params["colormap"], params["clip"])
+    return {
+        "verts": verts,
+        "faces": faces,
+        "colors": mesher.colormap(values, lo, hi, name=params["colormap"]),
+        "values": values,
+    }
+
+
+def organic_preview(state, problem, payload) -> dict:
+    """Quick live-preview mesh of an optimization state (coarse grid, light smoothing)."""
+    return evolved_geometry(
+        state, problem, payload["params"], payload["modules"]["mesher"], 2, clean=False
+    )
+
+
+# ------------------------------------------------------------------------- ribs
+def ribs_supported(streamlines) -> bool:
+    """Whether ``core/streamlines.py`` can trace lines over a surface."""
+    try:
+        names = {f.name for f in dataclasses.fields(streamlines.TraceSettings)}
+    except TypeError:
+        return False
+    return "surface" in names and hasattr(streamlines, "SurfaceConstraint")
+
+
+def rib_tubes(lines, h, thickness, min_thickness, sculpt) -> list:
+    """Tubes along the rib lines: radius ~ sqrt(|sigma|), tapered open ends."""
+    hi = float(thickness) * h
+    lo = float(min_thickness) * hi
+    magnitudes = [np.abs(np.asarray(line.magnitude, dtype=np.float64)) for line in lines]
+    flat = np.concatenate(magnitudes) if magnitudes else np.zeros(0)
+    flat = flat[np.isfinite(flat)]
+    ref = float(np.percentile(flat, 99.0)) if flat.size else 1.0
+    ref = ref if ref > 0.0 else 1.0
+    tubes = []
+    for line, magnitude in zip(lines, magnitudes):
+        points = np.asarray(line.points, dtype=np.float64)
+        if points.shape[0] < 2:
+            continue
+        radius = lo + (hi - lo) * np.sqrt(np.clip(magnitude / ref, 0.0, 1.0))
+        if not getattr(line, "closed", False):
+            seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
+            s = np.concatenate([[0.0], np.cumsum(seg)])
+            total = max(float(s[-1]), 1e-12)
+            span = RIB_END_SPAN * total
+            end = np.minimum(s, total - s)
+            w = np.clip(end / max(span, 1e-12), 0.0, 1.0)
+            radius = radius * (RIB_END_TAPER + (1.0 - RIB_END_TAPER) * w * w * (3.0 - 2.0 * w))
+        tubes.append(sculpt.Tube(points=points, radius=radius, value=magnitude))
+    return tubes
+
+
+def skin_field(surface, iso, thickness, shape, origin, h, sculpt) -> np.ndarray:
+    """Shell of ``thickness`` (world) centred on the ``iso`` surface of ``surface``.
+
+    ``surface`` is an indicator dict (``field``, ``origin``, ``h``). Near the
+    surface ``|f - iso|`` grows like ``|grad f| d`` (distance ``d``), so
+    ``skin = 2 ISO (1 - |f - iso| / (|grad f| thickness))`` reaches the tube iso
+    level at ``d = thickness / 2``: a shell of the requested thickness, meshed
+    with the tubes at ``sculpt.TUBE_ISO``. ``|grad f|`` is the median gradient on
+    the surface.
+    """
+    f = np.asarray(surface["field"], dtype=np.float64)
+    gx, gy, gz = np.gradient(f, float(surface["h"]))
+    near = np.abs(f - iso) < 0.15
+    grad = np.sqrt(gx * gx + gy * gy + gz * gz)
+    g = float(np.median(grad[near])) if near.any() else 1.0 / float(surface["h"])
+    values = indicator_on_grid(
+        {"field": f, "origin": surface["origin"], "h": surface["h"]}, shape, origin, h, sculpt
+    )
+    width = max(g * float(thickness), 1e-9)
+    return np.maximum(2.0 * sculpt.TUBE_ISO * (1.0 - np.abs(values - iso) / width), 0.0)
+
+
+class SurfaceField:
+    """Trilinear scalar field (element-centred) with its analytic gradient (worker-safe)."""
+
+    def __init__(self, field, origin, h):
+        self.field = np.asarray(field, dtype=np.float64)
+        self.origin = np.asarray(origin, dtype=np.float64)
+        self.h = float(h)
+        self._top = np.asarray(self.field.shape, dtype=np.float64) - 1.0
+        self._last = np.maximum(np.asarray(self.field.shape, dtype=np.int64) - 2, 0)
+
+    def sample(self, points) -> tuple:
+        """``(value (P,), gradient (P, 3))`` at world points (clamped to the grid)."""
+        u = (np.asarray(points, dtype=np.float64).reshape(-1, 3) - self.origin) / self.h - 0.5
+        u = np.clip(u, 0.0, self._top)
+        i0 = np.minimum(np.floor(u).astype(np.int64), self._last)
+        t = u - i0
+        f = self.field
+        i, j, k = i0[:, 0], i0[:, 1], i0[:, 2]
+        c = {}
+        for a in (0, 1):
+            for b in (0, 1):
+                for d in (0, 1):
+                    c[a, b, d] = f[np.minimum(i + a, f.shape[0] - 1),
+                                   np.minimum(j + b, f.shape[1] - 1),
+                                   np.minimum(k + d, f.shape[2] - 1)]
+        tx, ty, tz = t[:, 0], t[:, 1], t[:, 2]
+        sx, sy, sz = 1.0 - tx, 1.0 - ty, 1.0 - tz
+        value = (
+            sx * (sy * (sz * c[0, 0, 0] + tz * c[0, 0, 1]) + ty * (sz * c[0, 1, 0] + tz * c[0, 1, 1]))
+            + tx * (sy * (sz * c[1, 0, 0] + tz * c[1, 0, 1]) + ty * (sz * c[1, 1, 0] + tz * c[1, 1, 1]))
+        )
+        gx = sy * (sz * (c[1, 0, 0] - c[0, 0, 0]) + tz * (c[1, 0, 1] - c[0, 0, 1])) + ty * (
+            sz * (c[1, 1, 0] - c[0, 1, 0]) + tz * (c[1, 1, 1] - c[0, 1, 1]))
+        gy = sx * (sz * (c[0, 1, 0] - c[0, 0, 0]) + tz * (c[0, 1, 1] - c[0, 0, 1])) + tx * (
+            sz * (c[1, 1, 0] - c[1, 0, 0]) + tz * (c[1, 1, 1] - c[1, 0, 1]))
+        gz = sx * (sy * (c[0, 0, 1] - c[0, 0, 0]) + ty * (c[0, 1, 1] - c[0, 1, 0])) + tx * (
+            sy * (c[1, 0, 1] - c[1, 0, 0]) + ty * (c[1, 1, 1] - c[1, 1, 0]))
+        return value, np.stack([gx, gy, gz], axis=1) / self.h
+
+    def project(self, points, iso, iterations=3) -> tuple:
+        """Newton steps onto the ``iso`` level: ``(points, ok, normals)``.
+
+        ``ok``: converged within 2% of the field range per voxel and moved less than
+        two voxels; ``normals`` unit gradients (pointing to growing field values).
+        """
+        start = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+        p = start.copy()
+        for _ in range(int(iterations)):
+            value, grad = self.sample(p)
+            g2 = np.einsum("ij,ij->i", grad, grad)
+            step = np.divide(value - iso, g2, out=np.zeros_like(g2), where=g2 > 1e-18)
+            delta = step[:, None] * grad
+            length = np.linalg.norm(delta, axis=1)
+            scale = np.minimum(1.0, (0.75 * self.h) / np.maximum(length, 1e-30))
+            p -= delta * scale[:, None]
+        value, grad = self.sample(p)
+        gnorm = np.linalg.norm(grad, axis=1)
+        distance = np.abs(value - iso) / np.maximum(gnorm, 1e-30)
+        ok = (gnorm > 1e-9) & (distance < 0.05 * self.h)
+        ok &= np.linalg.norm(p - start, axis=1) < 2.0 * self.h
+        normals = grad / np.maximum(gnorm, 1e-30)[:, None]
+        return p, ok, normals
+
+
+def tangent_principal(tensors, normals, family) -> tuple:
+    """Principal direction of ``family`` in the tangent plane: ``(dirs, magnitude, gap)``.
+
+    The tensor is projected onto the plane ``P T P`` (``P = I - n n^T``); of its
+    eigenvectors the one closest to the normal is discarded; TENSION takes the
+    larger remaining eigenvalue, COMPRESSION the smaller. ``gap`` is their
+    difference relative to the largest magnitude (small = isotropic, direction
+    undefined).
+    """
+    n = np.asarray(normals, dtype=np.float64)
+    proj = np.eye(3)[None, :, :] - n[:, :, None] * n[:, None, :]
+    tt = proj @ np.asarray(tensors, dtype=np.float64) @ proj
+    w, v = np.linalg.eigh(tt)
+    along = np.abs(np.einsum("pi,pij->pj", n, v))
+    drop = np.argmax(along, axis=1)
+    order = np.argsort(np.where(np.arange(3)[None, :] == drop[:, None], np.inf, w), axis=1)
+    lo, hi = order[:, 0], order[:, 1]
+    rows = np.arange(w.shape[0])
+    pick = hi if family == "TENSION" else lo
+    dirs = v[rows, :, pick]
+    values = w[rows, pick]
+    scale = np.maximum(np.max(np.abs(w), axis=1), 1e-30)
+    gap = np.abs(w[rows, hi] - w[rows, lo]) / scale
+    return dirs, values, gap
+
+
+class _PointHash:
+    """Spatial hash of polyline points (cell = ``cell`` world units)."""
+
+    def __init__(self, cell):
+        self.cell = float(cell)
+        self.cells = {}
+
+    def _key(self, p):
+        return tuple(np.floor(np.asarray(p) / self.cell).astype(np.int64).tolist())
+
+    def add(self, points, tags):
+        for point, tag in zip(np.asarray(points), tags):
+            self.cells.setdefault(self._key(point), []).append((point, tag))
+
+    def near(self, point, radius, skip=None) -> bool:
+        """Any stored point within ``radius`` (entries with tag ``skip(tag)`` true ignored)."""
+        key = self._key(point)
+        r2 = radius * radius
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    bucket = self.cells.get((key[0] + dx, key[1] + dy, key[2] + dz))
+                    if not bucket:
+                        continue
+                    for other, tag in bucket:
+                        if skip is not None and skip(tag):
+                            continue
+                        d = other - point
+                        if float(d @ d) <= r2:
+                            return True
+        return False
+
+
+def surface_stress_lines(streamlines, surface, iso, stress, grid, options, seeds_on_surface,
+                         progress=None, should_stop=None, max_steps=600, max_lines=400,
+                         batch=96) -> list:
+    """Principal stress lines over the ``iso`` surface of ``surface`` (fallback tracer).
+
+    Used when ``core/streamlines.py`` has no surface mode. Same idea as that
+    mode: lines follow the principal directions of the stress tensor projected
+    onto the tangent plane (:func:`tangent_principal`), every RK2 step is projected
+    back onto the surface (Newton on the trilinear field), lines stop where the
+    stress drops below ``min_stress`` x the 99th percentile on the surface, where
+    the direction is undefined or turns by more than 60 degrees, and where they come
+    closer than ``separation`` voxels to an accepted line of their family (or to
+    their own earlier part: no curls). Seeds: ``seed_points`` (projected) first,
+    then surface points drawn with probability ~ stress. Candidates are integrated
+    in vectorized batches and accepted one by one (separation clipping, like the
+    core tracer). Returns ``streamlines.Polyline`` objects (generation 0).
+    """
+    field = SurfaceField(surface, grid.origin, grid.h)
+    tensors = streamlines.StressField(
+        grid=grid, stress=np.asarray(stress), solid=_dilate6(surface >= iso)
+    )
+    h = grid.h
+    step = min(float(options.get("step", 0.5)), 0.5 * float(options["separation"])) * h
+    separation = float(options["separation"]) * h
+    min_points = 5
+    rng = np.random.default_rng(int(options.get("rng_seed", 0)))
+    candidates = np.asarray(seeds_on_surface, dtype=np.float64).reshape(-1, 3)
+    cand_p, cand_ok, cand_n = field.project(candidates, iso)
+    candidates, cand_n = cand_p[cand_ok], cand_n[cand_ok]
+    out = []
+    families = tuple(options["families"])
+    total = max(len(families), 1)
+    for f_index, family in enumerate(families):
+        if candidates.shape[0] == 0:
+            break
+        dirs, values, _gap = tangent_principal(
+            tensors.sample_tensor(candidates), cand_n, family
+        )
+        magnitude = np.abs(values)
+        positive = magnitude[np.isfinite(magnitude)]
+        ref = float(np.percentile(positive, 99.0)) if positive.size else 0.0
+        if not ref > 0.0:
+            continue
+        floor = float(options.get("min_stress", 0.02)) * ref
+        weights = np.where(magnitude > floor, magnitude, 0.0)
+        if not weights.any():
+            continue
+        order = rng.choice(
+            candidates.shape[0],
+            size=min(int(options.get("n_seeds", 60)) * 6, int((weights > 0).sum())),
+            replace=False,
+            p=weights / weights.sum(),
+        )
+        explicit = options.get("seed_points")
+        seeds = candidates[order]
+        if explicit is not None and len(explicit):
+            ep, eok, _n = field.project(np.asarray(explicit, dtype=np.float64), iso)
+            seeds = np.vstack([ep[eok], seeds])
+        accepted = _PointHash(separation)
+        n_accepted = 0
+        cursor = 0
+        while cursor < seeds.shape[0] and n_accepted < max_lines:
+            check_stop(should_stop)
+            chunk = []
+            while cursor < seeds.shape[0] and len(chunk) < batch:
+                seed = seeds[cursor]
+                cursor += 1
+                if not accepted.near(seed, separation):
+                    chunk.append(seed)
+            if not chunk:
+                break
+            halves = _trace_halves(field, tensors, np.asarray(chunk), family, iso, step, floor,
+                                   max_steps)
+            for points, mags in halves:
+                if n_accepted >= max_lines:
+                    break
+                line = _accept_line(points, mags, accepted, separation, step, min_points,
+                                    n_accepted)
+                if line is None:
+                    continue
+                pts, mag, closed = line
+                out.append(
+                    streamlines.Polyline(
+                        points=pts,
+                        magnitude=mag,
+                        family=family,
+                        generation=0,
+                        sign=np.full(pts.shape[0], 1.0 if family == "TENSION" else -1.0),
+                        closed=closed,
+                    )
+                )
+                n_accepted += 1
+            if progress is not None:
+                progress(
+                    (f_index + min(1.0, cursor / max(seeds.shape[0], 1))) / total,
+                    f"Tracing ribs: {len(out)} line(s)",
+                )
+    return out
+
+
+def _trace_halves(field, tensors, seeds, family, iso, step, floor, max_steps) -> list:
+    """Integrate both halves of a line from every seed (vectorized); returns per seed
+    ``(points (n, 3), magnitudes (n,))`` with the seed in the middle."""
+    n = seeds.shape[0]
+    p0, ok0, normals = field.project(seeds, iso)
+    d0, v0, _g = tangent_principal(tensors.sample_tensor(p0), normals, family)
+    p = np.concatenate([p0, p0])
+    d_prev = np.concatenate([d0, -d0])
+    active = np.concatenate([ok0, ok0]) & np.concatenate([np.abs(v0) >= floor] * 2)
+    track = [p.copy()]
+    mags = [np.concatenate([np.abs(v0), np.abs(v0)])]
+    alive = active.copy()
+    for _ in range(int(max_steps)):
+        if not alive.any():
+            break
+        idx = np.flatnonzero(alive)
+        q = p[idx]
+        prev = d_prev[idx]
+        # midpoint step on the surface
+        _q1, _ok1, n1 = field.project(q, iso, iterations=1)
+        d1, _v1, g1 = tangent_principal(tensors.sample_tensor(q), n1, family)
+        d1 *= np.where(np.einsum("ij,ij->i", d1, prev) < 0.0, -1.0, 1.0)[:, None]
+        mid, okm, nm = field.project(q + 0.5 * step * d1, iso)
+        d2, _v2, g2 = tangent_principal(tensors.sample_tensor(mid), nm, family)
+        d2 *= np.where(np.einsum("ij,ij->i", d2, d1) < 0.0, -1.0, 1.0)[:, None]
+        new, okn, nn = field.project(q + step * d2, iso)
+        d3, v3, g3 = tangent_principal(tensors.sample_tensor(new), nn, family)
+        turn = np.einsum("ij,ij->i", d2, prev)
+        good = okm & okn & (np.abs(v3) >= floor) & (turn > 0.5) & (g2 > 1e-2) & (g3 > 1e-2)
+        moved = np.linalg.norm(new - q, axis=1)
+        good &= moved > 0.25 * step
+        stop = idx[~good]
+        alive[stop] = False
+        go = idx[good]
+        p[go] = new[good]
+        d3 *= np.where(np.einsum("ij,ij->i", d3, d2) < 0.0, -1.0, 1.0)[:, None]
+        d_prev[go] = d2[good]
+        record = np.full(p.shape, np.nan)
+        record[go] = p[go]
+        track.append(record)
+        m = np.full(p.shape[0], np.nan)
+        m[go] = np.abs(v3[good])
+        mags.append(m)
+    track = np.stack(track)  # (steps + 1, 2n, 3)
+    mags = np.stack(mags)
+    out = []
+    for i in range(n):
+        if not active[i]:
+            out.append((np.zeros((0, 3)), np.zeros(0)))
+            continue
+        fwd = track[:, i][np.isfinite(track[:, i, 0])]
+        bwd = track[:, n + i][np.isfinite(track[:, n + i, 0])]
+        fm = mags[:, i][np.isfinite(mags[:, i])]
+        bm = mags[:, n + i][np.isfinite(mags[:, n + i])]
+        points = np.vstack([bwd[::-1], fwd[1:]])
+        values = np.concatenate([bm[::-1], fm[1:]])
+        out.append((points, values, bwd.shape[0] - 1))
+    return out
+
+
+def _accept_line(points, mags, accepted, separation, step, min_points, tag) -> tuple:
+    """Clip a candidate at the first point too close to accepted lines or to itself."""
+    if len(points) == 0:
+        return None
+    points, mags, centre = points[0], points[1], points[2] if len(points) > 2 else 0
+    del mags
+    return None
+
+
+def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) -> dict:
+    """Worker: principal stress lines traced over ``surface`` -> fused rib lattice.
+
+    ``surface`` is the element-centred scalar field whose ``iso`` level is the
+    shell the ribs follow (optimized density, or the filtered block indicator),
+    ``stress`` the (nx, ny, nz, 6) stress on the same ``grid``.
+    """
+    modules = payload["modules"]
+    streamlines, sculpt, mesher = modules["streamlines"], modules["sculpt"], modules["mesher"]
+    job = payload["ribs"]
+    params = payload["params"]
+    warnings = []
+    # two empty layers around the grid: the surface closes inside it (a block that
+    # fills its grid has no iso crossing otherwise)
+    surface = np.pad(np.asarray(surface, dtype=np.float64), 2)
+    stress = np.pad(np.asarray(stress, dtype=np.float64), ((2, 2), (2, 2), (2, 2), (0, 0)))
+    grid = Grid(surface.shape, grid.origin - 2.0 * grid.h, grid.h)
+    seeds = job["seeds"]
+    options = {
+        "families": job["families"],
+        "n_seeds": int(job["n_seeds"]),
+        "seed_points": None if seeds is None or len(seeds) == 0 else np.asarray(seeds),
+        "step": float(job["step"]),
+        "min_stress": float(job["min_stress"]),
+        "separation": float(job["spacing"]),
+        "branch_depth": 0,
+        "rng_seed": int(job["rng_seed"]),
+    }
+    trace_progress = _sub_progress(progress, 0.0, 0.45)
+    if ribs_supported(streamlines):
+        field = streamlines.StressField(
+            grid=grid, stress=np.asarray(stress), solid=_dilate6(surface >= iso)
+        )
+        trace_settings = streamlines.TraceSettings(
+            surface=streamlines.SurfaceConstraint(field=surface, iso=float(iso)), **options
+        )
+        lines = list(
+            streamlines.trace(
+                field, trace_settings, progress=trace_progress, should_stop=should_stop
+            )
+        )
+    else:  # this core has no surface tracing: thin-shell approximation
+        lines = shell_rib_lines(
+            streamlines,
+            mesher,
+            surface,
+            iso,
+            stress,
+            grid,
+            streamlines.TraceSettings(**options),
+            trace_progress,
+            should_stop,
+        )
+    if not lines:
+        raise ValueError("No stress lines found on the surface: lower Spacing or Min Stress")
+    h = grid.h
+    tubes = rib_tubes(lines, h, job["thickness"], job["min_thickness"], sculpt)
+    pad_radius = max(1.6 * float(job["thickness"]), 0.8 * float(job["pad"])) * h
+    anchors = np.asarray(job["anchors"], dtype=np.float64).reshape(-1, 3)
+    for point in anchors:  # contact pads: the lattice reaches every load and support
+        tubes.append(sculpt.Tube(points=point[None, :], radius=pad_radius, value=0.0))
+    thinnest = min(float(np.min(t.radius)) for t in tubes)
+    voxel = min(h / max(float(job["detail"]), 1e-3), max(thinnest / 1.25, 0.2 * h))
+    pts = np.concatenate([np.asarray(t.points) for t in tubes])
+    voxel = _cap_voxel(
+        voxel,
+        pts.min(axis=0) - 3.0 * pad_radius,
+        pts.max(axis=0) + 3.0 * pad_radius,
+        SCULPT_MAX_CELLS,
+        warnings,
+        "The rib surface",
+    )
+    progress(0.5, "Shaping the ribs")
+    tube_field, origin, voxel, values = sculpt.tubes_field(
+        tubes,
+        voxel,
+        blend=float(job["blend"]),
+        progress=_sub_progress(progress, 0.5, 0.75),
+        should_stop=should_stop,
+    )
+    tube_field = np.asarray(tube_field, dtype=np.float64)
+    origin = np.asarray(origin, dtype=np.float64)
+    values = np.asarray(values, dtype=np.float64)
+    if float(job["skin"]) > 0.0:
+        shell = skin_field(
+            {"field": surface, "origin": grid.origin, "h": h},
+            iso,
+            float(job["skin"]) * h,
+            tube_field.shape,
+            origin,
+            voxel,
+            sculpt,
+        )
+        tube_field = sculpt.union_fields(tube_field, shell, float(job["blend"]))
+    check_stop(should_stop)
+    tiso = sculpt.TUBE_ISO
+    clipped = support_clips(tube_field, origin, voxel, tiso, payload, sculpt)
+    progress(0.8, "Building the surface")
+    verts, faces = structure_surface(
+        tube_field,
+        clipped,
+        origin,
+        voxel,
+        tiso,
+        params["smooth"],
+        mesher,
+        structure_anchors(payload, voxel),
+        support_planes(payload),
+    )
+    if faces.shape[0] == 0:
+        raise ValueError("The ribs came out empty: raise their Thickness")
+    vertex_values = sample_field(values, values > 0.0, _GridLike(origin, voxel), verts, mesher)
+    geometry = _colored(verts, faces, vertex_values, params["colormap"], params["clip"], mesher)
+    progress(1.0, "Done")
+    return {"geometry": geometry, "warnings": warnings, "lines": len(lines)}
+
+
+# ------------------------------------------------------------------ main thread
+def _object_indicator(obj, depsgraph, voxel, pad=3) -> dict:
+    """Fine voxelization of an object (for flush cuts), blurred: dict field/origin/h."""
+    verts, tris = scene_io.evaluated_world_mesh(obj, depsgraph)
+    if tris.shape[0] == 0:
+        return None
+    bmin, bmax = verts[np.unique(tris)].min(axis=0), verts[np.unique(tris)].max(axis=0)
+    extent = np.maximum(bmax - bmin, 1e-9)
+    voxel = max(float(voxel), float(extent.max()) / OBJECT_MAX_SIDE)
+    cells = float(np.prod(np.ceil(extent / voxel) + 2 * pad))
+    if cells > OBJECT_MAX_CELLS:
+        voxel *= (cells / OBJECT_MAX_CELLS) ** (1.0 / 3.0)
+    counts = np.maximum(1, np.ceil(extent / voxel - 1e-9).astype(np.int64)) + 2 * pad
+    origin = 0.5 * (bmin + bmax) - 0.5 * counts * voxel
+    grid = Grid(tuple(int(c) for c in counts), origin, voxel)
+    inside = scene_io.voxelize_mesh(verts, tris, grid)
+    if not inside.any():
+        return None
+    return {
+        "field": _blur121(inside.astype(np.float64)),
+        "origin": grid.origin,
+        "h": grid.h,
+        "inside": inside,
+    }
+
+
+def _footprint(indicator, contacts=None) -> dict:
+    """The object's plan (for ``inset_contacts``); ``under`` flags the contacts that sit
+    on its underside (the object fills the space just above them)."""
+    if indicator is None:
+        return None
+    out = {
+        "mask": indicator["inside"].any(axis=2),
+        "origin": indicator["origin"][:2],
+        "h": indicator["h"],
+    }
+    if contacts is not None:
+        contacts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
+        grid = Grid(indicator["inside"].shape, indicator["origin"], indicator["h"])
+        probe = contacts + np.array([0.0, 0.0, 1.5 * grid.h])
+        ijk = np.floor((probe - grid.origin) / grid.h).astype(np.int64)
+        ok = np.all((ijk >= 0) & (ijk < np.asarray(grid.shape)), axis=1)
+        under = np.zeros(contacts.shape[0], dtype=bool)
+        under[ok] = indicator["inside"][ijk[ok, 0], ijk[ok, 1], ijk[ok, 2]]
+        out["under"] = under
+    return out
+
+
+def _nodes_near(grid, node_ids, points, radius) -> list:
+    """Per point: node ids within ``radius`` (else the nearest ones)."""
+    coords = grid.origin + np.stack(np.unravel_index(node_ids, grid.nodes_shape), axis=1) * grid.h
+    found = []
+    for point in np.asarray(points, dtype=np.float64).reshape(-1, 3):
+        dist = np.linalg.norm(coords - point, axis=1)
+        near = node_ids[dist <= radius]
+        if near.size == 0:
+            near = node_ids[dist <= dist.min() + 0.5 * grid.h]
+        found.append(near)
+    return found
+
+
+def support_design_problem(context, settings, target, contacts, forces, footings, floor,
+                           full_contact, warnings, footprint=None):
+    """Problem of the SUPPORT / ORGANIC mode (main thread).
+
+    Automatic design box from the ground (``floor``) to the highest contact + 1
+    voxel, in plan the contacts and footings grown by ``0.35 H`` (at least 2
+    voxels). The object and everything above its underside (inside its
+    footprint) is void; solid pads of ``load_pad`` voxels sit at the contacts
+    and footings (pads win over the void); every load is spread over the nodes
+    of its pad; footings fix the bottom nodes of their pad (all axes), or the
+    whole bottom layer with ``full_contact``. With a ``footprint`` (the object's
+    plan) the contact pads are slid under the object (corners, edges). Returns
+    ``(problem, info)``; ``info["contacts"]`` are the pad centres.
+    """
+    fem = core_module("fem")
+    contacts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
+    footings = np.zeros((0, 3)) if footings is None else np.asarray(footings).reshape(-1, 3)
+    height = max(float(contacts[:, 2].mean()) - floor, 1e-6)
+    plan = np.vstack([contacts, footings]) if footings.shape[0] else contacts
+    resolution = int(settings.resolution)
+    grow = 0.35 * height
+    h = 1.0
+    for _ in range(2):  # the growth depends on the voxel size and vice versa
+        lo = np.array([plan[:, 0].min() - grow, plan[:, 1].min() - grow, floor])
+        hi = np.array([plan[:, 0].max() + grow, plan[:, 1].max() + grow, contacts[:, 2].max()])
+        h = float((hi - lo).max()) / max(resolution, 1)
+        grow = max(0.35 * height, 2.0 * h)
+    hi[2] += h
+    counts = np.maximum(1, np.ceil((hi - lo) / h - 1e-9).astype(np.int64))
+    origin = np.array(
+        [
+            0.5 * (lo[0] + hi[0]) - 0.5 * counts[0] * h,
+            0.5 * (lo[1] + hi[1]) - 0.5 * counts[1] * h,
+            floor,
+        ]
+    )
+    grid = Grid(tuple(int(c) for c in counts), origin, h)
+    depsgraph = context.evaluated_depsgraph_get()
+    verts, tris = scene_io.evaluated_world_mesh(target, depsgraph)
+    inside = scene_io.voxelize_mesh(verts, tris, grid)
+    shadow = np.logical_or.accumulate(inside, axis=2)  # the object and all above its underside
+    centres = grid.element_centers()
+    pad = max(float(settings.load_pad), 0.5) * h
+    foot_pad = max(1.3 * pad, 1.5 * h)
+    if footprint is not None:
+        contacts = inset_contacts(contacts, np.full(contacts.shape[0], pad), footprint, 1.0)
+    pads = np.zeros(grid.shape, dtype=bool)
+    for point in contacts:
+        pads |= np.einsum("...i,...i->...", centres - point, centres - point) <= pad * pad
+    for point in footings:
+        pads |= np.einsum("...i,...i->...", centres - point, centres - point) <= foot_pad * foot_pad
+    domain = np.ones(grid.shape, dtype=bool)
+    solid, void, bias, branch, zone_warnings = scene_io.zone_fields(
+        context, grid, domain, exclude=(target,), method=settings.voxelize_method
+    )
+    warnings.extend(zone_warnings)
+    passive_solid = pads if solid is None else (pads | solid)
+    passive_void = shadow if void is None else (shadow | void)
+    passive_void &= ~pads
+
+    all_nodes = np.arange(grid.n_nodes, dtype=np.int64)
+    forces_out = np.zeros(grid.n_dofs, dtype=np.float64)
+    fxyz = forces_out.reshape(-1, 3)
+    for nodes, force in zip(_nodes_near(grid, all_nodes, contacts, max(pad, 0.75 * h)), forces):
+        fxyz[nodes] += np.asarray(force) / nodes.size
+    if full_contact:
+        k0 = np.zeros(grid.nodes_shape, dtype=bool)
+        k0[:, :, 0] = True
+        fixed_nodes = np.flatnonzero(k0.ravel())
+    else:
+        node_xyz = grid.node_coords()
+        fixed_list = []
+        for point in footings:
+            plan_d = np.linalg.norm(node_xyz[:, :2] - point[:2], axis=1)
+            low = node_xyz[:, 2] <= point[2] + 0.5 * h
+            near = np.flatnonzero((plan_d <= foot_pad) & low & (node_xyz[:, 2] >= point[2] - h))
+            if near.size == 0:
+                dist = np.linalg.norm(node_xyz - point, axis=1)
+                near = np.flatnonzero(dist <= dist.min() + 0.5 * h)
+            fixed_list.append(near)
+        fixed_nodes = np.unique(np.concatenate(fixed_list))
+    fixed = (3 * fixed_nodes[:, None] + np.arange(3)[None, :]).ravel()
+    problem = Problem(
+        grid=grid,
+        domain=domain,
+        fixed_dofs=fixed,
+        forces=forces_out,
+        passive_solid=passive_solid,
+        passive_void=passive_void,
+        bias=bias,
+        branch=branch,
+        E=float(settings.youngs_modulus) * 1e9,
+        nu=float(settings.poisson_ratio),
+    )
+    warnings.extend(fem.check_problem(problem))
+    seeds_at = np.vstack([contacts, footings]) if footings.shape[0] else contacts
+    flat_centres = centres.reshape(-1, 3)
+    seed_points = flat_centres[
+        [int(np.argmin(np.linalg.norm(flat_centres - p, axis=1))) for p in seeds_at]
+    ]
+    info = {
+        "warnings": warnings,
+        "loads": [(p, f / max(np.linalg.norm(f), 1e-30), float(np.linalg.norm(f)))
+                  for p, f in zip(contacts, forces)],
+        "supports": [p for p in footings],
+        "seed_points": seed_points,
+        "domain_name": target.name,
+        "n_elems": int(domain.sum()),
+        "bounds": (grid.origin, grid.origin + grid.size),
+        "ambiguous_rays": 0,
+        "pad": pad,
+        "contacts": contacts,
+    }
+    return problem, info
+
+
+def _support_box_voxel(contacts, footings, floor, resolution) -> float:
+    """Voxel size of the SUPPORT design box (same rule as ``support_design_problem``)."""
+    contacts = np.asarray(contacts, dtype=np.float64).reshape(-1, 3)
+    footings = np.zeros((0, 3)) if footings is None else np.asarray(footings).reshape(-1, 3)
+    height = max(float(contacts[:, 2].mean()) - floor, 1e-6)
+    plan = np.vstack([contacts, footings]) if footings.shape[0] else contacts
+    grow, h = 0.35 * height, 1.0
+    for _ in range(2):
+        extent = np.array(
+            [np.ptp(plan[:, 0]) + 2 * grow, np.ptp(plan[:, 1]) + 2 * grow,
+             float(contacts[:, 2].max()) - floor]
+        )
+        h = float(extent.max()) / max(int(resolution), 1)
+        grow = max(0.35 * height, 2.0 * h)
+    return h
+
+
+def _structure_box_volume(contacts, footings, floor) -> float:
+    pts = np.vstack([contacts, footings]) if len(footings) else np.asarray(contacts)
+    height = max(float(np.asarray(contacts)[:, 2].mean()) - floor, 1e-6)
+    grow = 0.35 * height
+    size = np.array(
+        [
+            np.ptp(pts[:, 0]) + 2 * grow,
+            np.ptp(pts[:, 1]) + 2 * grow,
+            max(float(np.asarray(contacts)[:, 2].max()) - floor, 1e-6),
+        ]
+    )
+    return float(np.prod(size))
+
+
+def _opt_settings_for(settings, topopt, volume_fraction):
+    opt = _opt_settings(settings, topopt)
+    return dataclasses.replace(opt, volfrac=float(volume_fraction))
+
+
+def _structure_params(settings) -> dict:
+    return {
+        "iso": float(settings.iso_level),
+        "smooth": int(settings.smooth_iterations),
+        "colormap": settings.colormap,
+        "clip": float(settings.color_clip),
+    }
+
+
+def _families(settings) -> tuple:
+    return {
+        "BOTH": ("TENSION", "COMPRESSION"),
+        "TENSION": ("TENSION",),
+        "COMPRESSION": ("COMPRESSION",),
+    }[settings.line_families]
+
+
+def structure_request(context, settings, preview=False) -> dict:
+    """Everything "Generate Structure" needs, gathered on the main thread.
+
+    Raises ``ValueError`` with an actionable message for setups that cannot
+    work (no object, no weights, Carve Inside without supports, every weight
+    below the ground, ribs without surface tracing, ...).
+    """
+    scene = context.scene
+    target = scene_io.validated_target(context, settings)
+    mode, style = settings.structure_mode, settings.structure_style
+    depsgraph = context.evaluated_depsgraph_get()
+    warnings = []
+    loads = scene_io.structure_loads(context, exclude=(target,))
+    if not loads:
+        raise ValueError(
+            "No weights: in Edit Mode select points or faces of the object and use "
+            "'Put Weight on Selection'"
+        )
+    supports = scene_io.structure_supports(context, exclude=(target,))
+    modules = _modules("forms", "sculpt", "mesher", "fem")
+    if style in {KIND_ORGANIC, KIND_RIBS} and not (style == KIND_RIBS and mode == "CARVE"
+                                                    and settings.rib_source == "SURFACE"):
+        try:
+            modules["topopt"] = core_module("topopt")
+        except RuntimeError as exc:
+            raise ValueError(
+                "The Organic style needs core/topopt.py, which is missing: use Branching"
+            ) from exc
+    if style == KIND_RIBS:
+        if "topopt" not in modules:  # its density filter shapes the block's rib surface
+            try:
+                modules["topopt"] = core_module("topopt")
+            except RuntimeError:
+                pass
+        modules["streamlines"] = core_module("streamlines")
+        if not ribs_supported(modules["streamlines"]):
+            print("Stress Sculpt: core/streamlines.py has no surface tracing: ribs use the "
+                  "thin-shell approximation")
+    points = np.array([load["position"] for load in loads])
+    forces = np.array([load["force"] for load in loads])
+    params = _structure_params(settings)
+    payload = {
+        "scene": scene.name,
+        "target": target.name,
+        "mode": mode,
+        "style": style,
+        "modules": modules,
+        "params": params,
+        "warnings": warnings,
+        "preview": bool(preview) and bool(settings.live_update),
+        "loads": loads,
+        "supports": supports,
+        "object": None,
+        "floor": float(settings.ground_height),
+        "ground": float(settings.ground_height),
+        "contact": settings.ground_contact,
+    }
+    t_verts, t_tris = scene_io.evaluated_world_mesh(target, depsgraph)
+    if t_tris.shape[0] == 0:
+        raise ValueError(f"The object '{target.name}' has no faces")
+    t_min, t_max = t_verts.min(axis=0), t_verts.max(axis=0)
+    longest = float(np.max(t_max - t_min))
+
+    if mode == "SUPPORT":
+        ground = float(settings.ground_height)
+        contacts, moved = scene_io.underside_contacts(
+            t_verts, t_tris, points, forces / np.linalg.norm(forces, axis=1)[:, None]
+        )
+        if moved.any():
+            warnings.append(
+                f"{int(moved.sum())} weight(s) on top of '{target.name}' are carried from its "
+                "underside"
+            )
+        above = contacts[:, 2] > ground + 1e-6
+        if not above.any():
+            raise ValueError(
+                f"Every weight is at or below the ground (Ground = {ground:.3g} m): raise the "
+                "object or lower the Ground"
+            )
+        if not above.all():
+            warnings.append(f"{int((~above).sum())} weight(s) below the ground were ignored")
+        contacts, forces, points = contacts[above], forces[above], points[above]
+        payload["load_names"] = [load["name"] for load, ok in zip(loads, above) if ok]
+        explicit = np.array([s["position"] for s in supports]) if supports else None
+        if explicit is not None:
+            if np.all(explicit[:, 2] >= contacts[:, 2].min() - 1e-9):
+                raise ValueError(
+                    "The supports are not below the weights: in Support Object mode the "
+                    "structure stands on footings below the object (or remove the supports to "
+                    "place footings automatically; use Carve Inside to anchor the object itself)"
+                )
+            if any(s["parent"] == target.name for s in supports):
+                warnings.append("Some supports sit on the carried object itself")
+        full = settings.ground_contact == "FULL"
+        if explicit is not None:
+            footings = explicit
+            payload["floor"] = min(ground, float(explicit[:, 2].min()))
+        else:
+            footings = modules["forms"].auto_footings(contacts, forces, ground, int(settings.footings))
+        payload.update(contacts=contacts, forces=forces, footings=footings, explicit=explicit)
+        height = max(float(contacts[:, 2].mean()) - ground, 1e-6)
+        payload["height"] = height
+        payload["box_volume"] = _structure_box_volume(contacts, footings, ground)
+    else:
+        if not supports:
+            raise ValueError(
+                "Carve Inside needs supports: select where the block rests (Edit Mode) and use "
+                "'Support at Selection'"
+            )
+        contacts = points
+        payload["load_names"] = [load["name"] for load in loads]
+        payload.update(contacts=contacts, forces=forces, footings=np.array(
+            [s["position"] for s in supports]), explicit=None)
+        payload["box_volume"] = abs(mesh_volume(t_verts, t_tris)) or float(np.prod(t_max - t_min))
+
+    # ------------------------------------------------------------------ per style
+    voxel_hint = longest / max(int(settings.resolution), 1)
+    if style == KIND_BRANCHING:
+        tree_params = {
+            "footings": int(settings.footings),
+            "branching": int(settings.tree_branching),
+            "split": float(settings.tree_split),
+            "levels": float(settings.tree_levels),
+            "organic": float(settings.tree_organic),
+            "min_thickness": float(settings.tree_min_thickness),
+            "footing_flare": float(settings.tree_footing_flare),
+            "capital_flare": float(settings.tree_capital_flare),
+        }
+        if mode == "SUPPORT":
+            height = payload["height"]
+            supports_arg = payload["explicit"]
+            ground_arg = float(settings.ground_height)
+            constrain = None
+        else:
+            sup = payload["footings"]
+            up = -forces.sum(axis=0)
+            up = up / max(np.linalg.norm(up), 1e-30) if np.linalg.norm(up) > 1e-12 else np.array(
+                [0.0, 0.0, 1.0])
+            rise = [
+                float(np.dot(p - sup[np.argmin(np.linalg.norm(sup - p, axis=1))], up))
+                for p in contacts
+            ]
+            height = max(float(np.mean(rise)), 1e-3 * longest, 1e-6)
+            supports_arg = sup
+            ground_arg = None
+            problem_grid = Grid.from_bounds(t_min, t_max, int(settings.resolution), pad=0)
+            domain = scene_io.voxelize_mesh(t_verts, t_tris, problem_grid)
+            if not domain.any():
+                raise ValueError(
+                    f"No voxel lies inside '{target.name}': the block must be a closed mesh"
+                )
+            constrain = nearest_inside(domain, problem_grid)
+        radius_max = float(settings.tree_thickness) * height
+        radius_min = float(settings.tree_min_thickness) * radius_max
+        detail = float(settings.tree_detail)
+        payload["branching"] = {
+            "points": contacts,
+            "forces": forces,
+            "tree": tree_params,
+            "radius_max": radius_max,
+            "supports": supports_arg,
+            "ground": ground_arg,
+            "constrain": constrain,
+            "detail": detail,
+            "blend": float(settings.tree_blend),
+            "footprint": None,
+        }
+        fine = radius_min / max(detail, 1e-3)
+        payload["object"] = _object_indicator(target, depsgraph, max(fine, voxel_hint / 6.0))
+        if mode == "SUPPORT":
+            payload["branching"]["footprint"] = _footprint(payload["object"], contacts)
+        payload["thinnest"] = radius_min
+        payload["signature"] = _array_digest("branching", mode, contacts, forces,
+                                             supports_arg, ground_arg, sorted(tree_params.items()),
+                                             radius_max, detail, settings.tree_blend,
+                                             params["smooth"], t_verts, t_tris)
+        return payload
+
+    # ORGANIC (and the optimized shape under RIBS)
+    topopt = modules.get("topopt")
+    if mode == "SUPPORT":
+        full = settings.ground_contact == "FULL" and payload["explicit"] is None
+        box_h = _support_box_voxel(payload["contacts"], payload["footings"], payload["floor"],
+                                   int(settings.resolution))
+        payload["object"] = _object_indicator(target, depsgraph, box_h / ORGANIC_UPSAMPLE)
+        problem, info = support_design_problem(
+            context,
+            settings,
+            target,
+            payload["contacts"],
+            payload["forces"],
+            None if full else payload["footings"],
+            payload["floor"],
+            full,
+            warnings,
+            footprint=_footprint(payload["object"], payload["contacts"]),
+        )
+        fraction = float(settings.support_material)
+        payload["pad"] = info["pad"]
+        payload["contacts"] = info["contacts"]
+    else:
+        problem, info = scene_io.gather_problem(context, settings, domain=target)
+        warnings.extend(info["warnings"])
+        info = dict(info, warnings=[])
+        fraction = float(settings.volume_fraction)
+        payload["pad"] = max(float(settings.load_pad), 0.5) * problem.grid.h
+    payload["problem"] = problem
+    payload["info"] = info
+    payload["thinnest"] = problem.grid.h
+    payload["top"] = float(np.max(payload["contacts"][:, 2])) if mode == "SUPPORT" else None
+    if payload["object"] is None:
+        payload["object"] = _object_indicator(
+            target, depsgraph, problem.grid.h / ORGANIC_UPSAMPLE
+        )
+    need_optimizer = not (style == KIND_RIBS and mode == "CARVE" and settings.rib_source == "SURFACE")
+    if need_optimizer:
+        payload["opt"] = _opt_settings_for(settings, topopt, fraction)
+        payload["organic_signature"] = problem_digest(problem, payload["opt"])
+        cached = jobs.get_cache(scene).structure
+        payload["reuse"] = None
+        if (
+            style == KIND_RIBS
+            and cached is not None
+            and cached.get("organic_signature") == payload["organic_signature"]
+            and cached.get("state") is not None
+        ):
+            payload["reuse"] = cached["state"]
+    else:
+        payload["opt"] = None
+        payload["organic_signature"] = None
+        payload["reuse"] = None
+        payload["solver"] = {
+            "solver": settings.solver,
+            "tol": float(settings.solver_tolerance),
+            "maxiter": int(settings.max_solver_iterations),
+            "rmin": float(settings.filter_radius),
+        }
+    if style == KIND_RIBS:
+        anchors = np.vstack([payload["contacts"], payload["footings"]]) if len(
+            payload["footings"]) else payload["contacts"]
+        payload["ribs"] = {
+            "families": _families(settings),
+            "n_seeds": max(int(settings.n_seeds), 60),
+            "seeds": anchors,
+            "anchors": anchors,
+            "step": float(settings.line_step),
+            "min_stress": float(settings.line_min_stress),
+            "spacing": float(settings.rib_spacing),
+            "thickness": float(settings.rib_thickness),
+            "min_thickness": float(settings.rib_min_thickness),
+            "skin": float(settings.rib_skin),
+            "blend": float(settings.sculpt_blend),
+            "detail": float(settings.sculpt_detail),
+            "pad": float(settings.load_pad),
+            "rng_seed": int(settings.random_seed),
+            "source": "SURFACE" if mode == "CARVE" and settings.rib_source == "SURFACE"
+            else "EVOLVED",
+        }
+    payload["signature"] = _array_digest(
+        style, mode, payload["organic_signature"], sorted(payload.get("ribs", {}).items(),
+                                                            key=lambda kv: kv[0]).__repr__()
+    )
+    return payload
+
+
+def structure_compute(payload, progress, should_stop, emit) -> dict:
+    """Worker side of "Generate Structure" (pure numpy)."""
+    style, mode = payload["style"], payload["mode"]
+    out = {"payload": payload, "warnings": [], "state": None, "kind": style}
+    if style == KIND_BRANCHING:
+        out.update(branching_geometry(payload, progress, should_stop))
+        return out
+
+    problem = payload["problem"]
+    state = None
+    max_displacement = 0.0
+    ribs = style == KIND_RIBS
+    organic_span = (0.0, 0.55) if ribs else (0.0, 0.9)
+    if payload["opt"] is not None:
+        state = payload.get("reuse")
+        if state is None:
+            topopt = payload["modules"]["topopt"]
+
+            def on_state(current):
+                snapshot = {"payload": payload, "state": current, "partial": True}
+                if payload["preview"]:
+                    snapshot["preview"] = organic_preview(current, problem, payload)
+                emit(snapshot)
+
+            optimizer, state = run_optimizer(
+                topopt,
+                problem,
+                payload["opt"],
+                _sub_progress(progress, *organic_span),
+                should_stop,
+                on_state,
+            )
+            max_displacement = _max_displacement(
+                optimizer, state, problem, payload["opt"], should_stop
+            )
+            out["fresh_state"] = True
+        out["state"] = state
+        out["max_displacement"] = max_displacement
+    if not ribs:
+        progress(0.92, "Building the surface")
+        out["geometry"] = organic_geometry(
+            state, problem, payload, payload["params"]["smooth"], should_stop=should_stop
+        )
+        progress(1.0, "Done")
+        return out
+
+    # ribs
+    rib_progress = _sub_progress(progress, organic_span[1], 1.0)
+    job = payload["ribs"]
+    if job["source"] == "SURFACE":
+        fem = payload["modules"]["fem"]
+        solver = payload["solver"]
+        result = fem.analyze(
+            problem,
+            solver=solver["solver"],
+            tol=solver["tol"],
+            maxiter=solver["maxiter"],
+            progress=_sub_progress(progress, 0.0, 0.5),
+            should_stop=should_stop,
+        )
+        surface = problem.domain.astype(np.float64)
+        topopt = payload["modules"].get("topopt")
+        if topopt is not None and hasattr(topopt, "DensityFilter"):
+            surface = np.asarray(
+                topopt.DensityFilter(problem.domain, max(solver["rmin"], 1.0)).forward(surface)
+            )
+        else:
+            surface = np.where(problem.domain, _blur121(surface), 0.0)
+        stress, iso = np.asarray(result.stress), 0.5
+        out["analysis"] = {
+            "compliance": float(result.compliance),
+            "max_stress": float(np.max(result.von_mises)),
+            "max_displacement": float(result.max_displacement),
+        }
+    else:
+        surface = np.where(problem.domain, np.asarray(state.density, dtype=np.float64), 0.0)
+        stress, iso = np.asarray(state.stress), float(payload["params"]["iso"])
+    out.update(
+        ribs_geometry(payload, surface, stress, problem.grid, iso, rib_progress, should_stop)
+    )
+    return out
+
+
+def _structure_partial(snapshot) -> dict:
+    """A cancelled organic optimization: finish with the last state."""
+    return {
+        "payload": snapshot["payload"],
+        "warnings": [],
+        "state": snapshot["state"],
+        "kind": KIND_ORGANIC,
+        "cancelled": True,
+        "max_displacement": 0.0,
+    }
+
+
+def _set_structure_props(obj, payload, output) -> None:
+    obj[PROP_MODE] = payload["mode"]
+    obj[PROP_STYLE] = output.get("kind", payload["style"])
+    obj[PROP_GROUND] = float(payload["ground"])
+    obj[PROP_CONTACT] = payload["contact"]
+    footings = output.get("footings")
+    if footings is None:
+        footings = payload.get("footings")
+    footings = np.asarray(footings if footings is not None else np.zeros((0, 3)), dtype=np.float64)
+    if footings.size:
+        obj[PROP_FOOTINGS] = [float(v) for v in footings.ravel()]
+    elif PROP_FOOTINGS in obj.keys():
+        del obj[PROP_FOOTINGS]
+    obj[PROP_THINNEST] = float(output.get("thinnest") or payload.get("thinnest") or 0.0)
+    obj[PROP_PAD] = float(payload.get("pad") or 0.0)
+    contacts = output.get("contacts")
+    if contacts is None:
+        contacts = payload.get("contacts")
+    names = payload.get("load_names") or []
+    contacts = np.asarray(contacts if contacts is not None else np.zeros((0, 3)), dtype=np.float64)
+    if contacts.size and len(names) == contacts.reshape(-1, 3).shape[0]:
+        obj[PROP_CONTACTS] = [float(v) for v in contacts.ravel()]
+        obj[PROP_LOADS] = "\n".join(names)
+    else:
+        for key in (PROP_CONTACTS, PROP_LOADS):
+            if key in obj.keys():
+                del obj[key]
+
+
+def _show_structure(context, scene, geometry, view_layer, payload):
+    with build.NewData() as new:
+        mesh = new.add(_mesh_from_geometry(build.OBJ_STRUCTURE, geometry))
+        obj = build.assign_result(
+            scene, build.OBJ_STRUCTURE, mesh, build.structure_material(), view_layer
+        )
+    build.set_result_material(obj, build.structure_material())
+    others = tuple(name for name in build.RESULT_OBJECTS if name != build.OBJ_STRUCTURE)
+    build.hide_results(scene, others, view_layer)
+    if payload["mode"] == "CARVE":
+        target = bpy.data.objects.get(payload["target"])
+        if target is not None and scene.stress_sculpt.domain_as_wire:
+            target.display_type = "WIRE"
+    build.use_attribute_colors(context)
+    return obj
+
+
+class STRESS_SCULPT_OT_generate(ThreadedOperatorMixin, Operator):
+    bl_idname = "stress_sculpt.generate"
+    bl_label = "Generate Structure"
+    bl_description = (
+        "Grow a structure that carries the weights: from the ground up to the object (Support "
+        "Object) or carved inside it (Carve Inside), in the chosen style. Esc stops (an organic "
+        "shape keeps its current state)"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+    job_name = "Generate"
+    keep_partial_on_cancel = True
+
+    def prepare(self, context):
+        _ensure_object_mode(context)
+        return structure_request(context, _settings(context), preview=self.is_async())
+
+    @staticmethod
+    def compute(payload, progress, should_stop, emit):
+        return structure_compute(payload, progress, should_stop, emit)
+
+    def on_partial(self, context, snapshot):
+        geometry = snapshot.get("preview")
+        if geometry is None or not len(geometry["faces"]):
+            return
+        payload = snapshot["payload"]
+        scene = bpy.data.scenes.get(payload["scene"])
+        if scene is None:
+            return
+        _show_structure(context, scene, geometry, _view_layer(context, scene), payload)
+
+    def result_from_partial(self, partial):
+        return _structure_partial(partial)
+
+    def finish(self, context, output):
+        payload = output["payload"]
+        scene = _job_scene(payload["scene"])
+        view_layer = _view_layer(context, scene)
+        kind = output.get("kind", payload["style"])
+        state = output.get("state")
+        geometry = output.get("geometry")
+        warnings = list(payload["warnings"]) + list(output.get("warnings") or [])
+        if geometry is None:  # cancelled optimization: mesh the last state here
+            geometry = organic_geometry(
+                state, payload["problem"], payload, payload["params"]["smooth"]
+            )
+        if len(geometry["faces"]) == 0:
+            raise ValueError(
+                "The structure came out empty: raise the Material amount (or lower Surface Level)"
+            )
+        obj = _show_structure(context, scene, geometry, view_layer, payload)
+        _set_structure_props(obj, payload, output)
+
+        cache = jobs.get_cache(scene)
+        entry = {
+            "kind": kind,
+            "mode": payload["mode"],
+            "signature": payload.get("signature"),
+            "organic_signature": payload.get("organic_signature"),
+            "problem": payload.get("problem"),
+            "state": state,
+            "footings": output.get("footings", payload.get("footings")),
+            "contacts": output.get("contacts", payload.get("contacts")),
+        }
+        if state is None and cache.structure is not None:
+            previous = cache.structure  # keep an earlier organic state for later ribs
+            if previous.get("state") is not None:
+                entry["state"] = previous["state"]
+                entry["organic_signature"] = previous.get("organic_signature")
+                entry["problem"] = previous.get("problem")
+        cache.structure = entry
+        if state is not None and output.get("fresh_state"):
+            cache.evolution = {  # the line tools can trace inside the generated shape
+                "problem": payload["problem"],
+                "state": state,
+                "settings": payload["opt"],
+                "signature": payload["organic_signature"],
+                "info": payload["info"],
+                "iso": payload["params"]["iso"],
+                "max_displacement": output.get("max_displacement"),
+            }
+
+        # metrics
+        volume = abs(mesh_volume(geometry["verts"], geometry["faces"]))
+        reference = max(float(payload.get("box_volume") or 0.0), 1e-30)
+        reach = max(
+            3.0 * float(payload.get("pad") or 0.0), 2.5 * float(payload.get("thinnest") or 0.0)
+        )
+        contacts = output.get("contacts", payload.get("contacts"))
+        far = unreached_points(contacts, geometry["verts"], max(reach, 1e-9) * 2.0)
+        if far.size:
+            warnings.append(
+                f"{far.size} weight(s) are not reached by the structure: raise the Material "
+                "amount or the Contact Size"
+            )
+        metrics = output.get("metrics") or {}
+        analysis = output.get("analysis") or {}
+        if state is not None:
+            max_stress = float(np.max(state.von_mises))
+            compliance = float(state.compliance)
+            iterations = int(state.iteration)
+        else:
+            max_stress = float(metrics.get("max_stress", analysis.get("max_stress", 0.0)))
+            compliance = float(analysis.get("compliance", 0.0))
+            iterations = 0
+        _set_last(
+            scene,
+            kind,
+            max_stress=max_stress,
+            max_displacement=float(
+                output.get("max_displacement") or analysis.get("max_displacement", 0.0)
+            ),
+            compliance=compliance,
+            volume=volume / reference,
+            iterations=iterations,
+        )
+        _report_warnings(self, warnings)
+        if kind == KIND_BRANCHING:
+            message = (
+                f"Branching structure: {metrics.get('members', 0)} members on "
+                f"{metrics.get('footings', 0)} footing(s), carrying "
+                f"{_format_force(metrics.get('total_load', 0.0))}"
+            )
+        elif kind == KIND_RIBS:
+            message = f"Ribs: {output.get('lines', 0)} stress line(s) over the shape"
+        else:
+            status = "stopped" if output.get("cancelled") else (
+                "converged" if getattr(state, "converged", False) else "done"
+            )
+            message = (
+                f"Organic structure ({iterations} iterations, {status}): "
+                f"material {getattr(state, 'volume', 0.0) * 100:.1f}%"
+            )
+        self.report({"INFO"}, message + f", {len(geometry['faces'])} faces")
+        return {"FINISHED"}
+
+
+# ------------------------------------------------------------------------ verify
+def verify_request(context, settings) -> dict:
+    """FEM check of SS_Structure: voxelized, loaded by the weights, held by its supports."""
+    scene = context.scene
+    obj = build.find_result(scene, build.OBJ_STRUCTURE)
+    if obj is None or obj.type != "MESH" or not len(obj.data.polygons):
+        raise ValueError("No structure to check: press Generate Structure first")
+    depsgraph = context.evaluated_depsgraph_get()
+    verts, tris = scene_io.evaluated_world_mesh(obj, depsgraph)
+    if tris.shape[0] == 0:
+        raise ValueError("The structure has no faces")
+    target = settings.target
+    keys = set(obj.keys())
+    mode = str(obj[PROP_MODE]) if PROP_MODE in keys else settings.structure_mode
+    ground = float(obj[PROP_GROUND]) if PROP_GROUND in keys else float(settings.ground_height)
+    contact = str(obj[PROP_CONTACT]) if PROP_CONTACT in keys else settings.ground_contact
+    thinnest = float(obj[PROP_THINNEST]) if PROP_THINNEST in keys else 0.0
+    warnings = []
+    bmin, bmax = verts.min(axis=0), verts.max(axis=0)
+    extent = np.maximum(bmax - bmin, 1e-9)
+    h = float(extent.max()) / max(int(settings.resolution), 1)
+    if thinnest > 0.0:
+        h = min(h, thinnest / 1.25)
+    cells = float(np.prod(np.ceil(extent / h) + 2))
+    if cells > VERIFY_MAX_CELLS:
+        h *= (cells / VERIFY_MAX_CELLS) ** (1.0 / 3.0)
+        if thinnest > 0.0 and h > thinnest:
+            warnings.append("The check grid is coarse for the thinnest members: results are rough")
+    counts = np.maximum(1, np.ceil(extent / h - 1e-9).astype(np.int64)) + 2
+    origin = 0.5 * (bmin + bmax) - 0.5 * counts * h
+    grid = Grid(tuple(int(c) for c in counts), origin, h)
+    domain = scene_io.voxelize_mesh(verts, tris, grid)
+    if not domain.any():
+        raise ValueError("The structure is thinner than one voxel: raise the Resolution")
+    active = np.flatnonzero(grid.nodes_of_elements(domain))
+    node_xyz = grid.origin + np.stack(np.unravel_index(active, grid.nodes_shape), axis=1) * h
+
+    loads = scene_io.structure_loads(context, exclude=(target,) if target is not None else ())
+    if not loads:
+        raise ValueError("No weights to check the structure with")
+    points = np.array([load["position"] for load in loads])
+    forces = np.array([load["force"] for load in loads])
+    stored_names = str(obj[PROP_LOADS]).split("\n") if PROP_LOADS in keys else []
+    if stored_names and stored_names == [load["name"] for load in loads]:
+        points = np.asarray(list(obj[PROP_CONTACTS]), dtype=np.float64).reshape(-1, 3)
+    elif mode == "SUPPORT" and target is not None and target.type == "MESH":
+        t_verts, t_tris = scene_io.evaluated_world_mesh(target, depsgraph)
+        points, _moved = scene_io.underside_contacts(
+            t_verts, t_tris, points, forces / np.linalg.norm(forces, axis=1)[:, None]
+        )
+    force_vec = np.zeros(grid.n_dofs, dtype=np.float64)
+    fxyz = force_vec.reshape(-1, 3)
+    for load, point, force in zip(loads, points, forces):
+        radius = max(float(load["radius"]), 1.5 * h, thinnest)
+        dist = np.linalg.norm(node_xyz - point, axis=1)
+        near = active[dist <= radius]
+        if near.size == 0:
+            near = active[dist <= dist.min() + 0.5 * h]
+            if dist.min() > 3.0 * h:
+                warnings.append(f"'{load['name']}' does not touch the structure")
+        fxyz[near] += force / near.size
+
+    fixed_nodes = []
+    supports = scene_io.structure_supports(context, exclude=(target,) if target else ())
+    if mode == "CARVE":
+        if not supports:
+            raise ValueError("No supports to hold the structure: add supports to the block")
+        for support in supports:
+            sobj = bpy.data.objects.get(support["name"])
+            inside = scene_io.region_mask_points(sobj, node_xyz) if sobj is not None else None
+            nodes = active[inside] if inside is not None and inside.any() else np.zeros(0, int)
+            if nodes.size == 0:
+                dist = np.linalg.norm(node_xyz - support["position"], axis=1)
+                nodes = active[dist <= max(dist.min() + 0.5 * h, 1.5 * h)]
+            axes = [a for a in range(3) if support["fix"][a]]
+            fixed_nodes.append((3 * nodes[:, None] + np.asarray(axes)[None, :]).ravel())
+    else:
+        if supports:
+            footings = np.array([s["position"] for s in supports])
+        elif PROP_FOOTINGS in keys and contact != "FULL":
+            footings = np.asarray(list(obj[PROP_FOOTINGS]), dtype=np.float64).reshape(-1, 3)
+        else:
+            footings = None
+        if footings is None or contact == "FULL" and not supports:
+            low = node_xyz[:, 2] <= max(ground, float(node_xyz[:, 2].min())) + 0.75 * h
+            nodes = active[low]
+            fixed_nodes.append((3 * nodes[:, None] + np.arange(3)[None, :]).ravel())
+        else:
+            for footing in footings:
+                dist = np.linalg.norm(node_xyz - footing, axis=1)
+                radius = max(2.5 * h, float(obj[PROP_PAD]) if PROP_PAD in keys else 0.0)
+                low = node_xyz[:, 2] <= footing[2] + 0.75 * h
+                nodes = active[(dist <= radius) & low]
+                if nodes.size == 0:
+                    nodes = active[dist <= dist.min() + 0.5 * h]
+                fixed_nodes.append((3 * nodes[:, None] + np.arange(3)[None, :]).ravel())
+    fixed = np.unique(np.concatenate(fixed_nodes)) if fixed_nodes else np.zeros(0, np.int64)
+    if fixed.size == 0:
+        raise ValueError("The structure touches no support")
+    fem = core_module("fem")
+    problem = Problem(
+        grid=grid,
+        domain=domain,
+        fixed_dofs=fixed,
+        forces=force_vec,
+        E=float(settings.youngs_modulus) * 1e9,
+        nu=float(settings.poisson_ratio),
+    )
+    problem, n_removed = fem.remove_unsupported_components(problem)
+    if n_removed:
+        warnings.append(f"{n_removed} part(s) of the structure touch no support (floating)")
+    if not problem.domain.any():
+        raise ValueError("No part of the structure touches a support")
+    problem.forces.reshape(-1, 3)[~grid.nodes_of_elements(problem.domain)] = 0.0
+    if not np.any(problem.forces):
+        raise ValueError("No weight acts on a supported part of the structure")
+    warnings.extend(fem.check_problem(problem))
+    mesh_verts = build.mesh_vertices(obj.data)
+    matrix = np.array(obj.matrix_world, dtype=np.float64)
+    return {
+        "scene": scene.name,
+        "problem": problem,
+        "warnings": warnings,
+        "solver": settings.solver,
+        "tol": float(settings.solver_tolerance),
+        "maxiter": int(settings.max_solver_iterations),
+        "points": mesh_verts @ matrix[:3, :3].T + matrix[:3, 3],
+        "colormap": settings.colormap,
+        "clip": float(settings.color_clip),
+        "fem": fem,
+        "mesher": core_module("mesher"),
+        "kind": str(obj[PROP_STYLE]) if PROP_STYLE in keys else settings.last_kind,
+    }
+
+
+class STRESS_SCULPT_OT_verify(ThreadedOperatorMixin, Operator):
+    bl_idname = "stress_sculpt.verify"
+    bl_label = "Check Generated Structure"
+    bl_description = (
+        "Solve the stresses of the generated structure under the weights and color it by von "
+        "Mises stress"
+    )
+    bl_options = {"REGISTER", "UNDO"}
+    job_name = "Check"
+
+    def prepare(self, context):
+        _ensure_object_mode(context)
+        return verify_request(context, _settings(context))
+
+    @staticmethod
+    def compute(payload, progress, should_stop, emit):
+        result = payload["fem"].analyze(
+            payload["problem"],
+            solver=payload["solver"],
+            tol=payload["tol"],
+            maxiter=payload["maxiter"],
+            progress=progress,
+            should_stop=should_stop,
+        )
+        problem = payload["problem"]
+        von_mises = np.asarray(result.von_mises, dtype=np.float64)
+        values = sample_field(
+            von_mises, problem.domain, problem.grid, payload["points"], payload["mesher"]
+        )
+        lo, hi = color_range(von_mises[problem.domain], False, payload["colormap"], payload["clip"])
+        colors = payload["mesher"].colormap(values, lo, hi, name=payload["colormap"])
+        return {"payload": payload, "result": result, "values": values, "colors": colors}
+
+    def finish(self, context, output):
+        payload, result = output["payload"], output["result"]
+        scene = _job_scene(payload["scene"])
+        obj = build.find_result(scene, build.OBJ_STRUCTURE)
+        if obj is None or len(obj.data.vertices) != len(output["values"]):
+            raise ValueError("The structure changed while it was checked: check it again")
+        build.set_mesh_stress(obj.data, output["colors"], output["values"])
+        build.set_result_material(obj, build.heatmap_material())
+        build.use_attribute_colors(context)
+        problem = payload["problem"]
+        max_stress = float(np.max(result.von_mises)) if problem.domain.any() else 0.0
+        settings = scene.stress_sculpt
+        kind = payload["kind"] if payload["kind"] in STRUCTURE_KINDS else settings.last_kind
+        _set_last(
+            scene,
+            kind or KIND_BRANCHING,
+            max_stress=max_stress,
+            max_displacement=result.max_displacement,
+            compliance=result.compliance,
+            volume=settings.last_volume,
+            iterations=settings.last_iterations,
+        )
+        _report_warnings(self, payload["warnings"])
+        if not result.info.get("converged", True):
+            self.report({"WARNING"}, "The solver did not fully converge: raise Max Solver Iterations")
+        self.report(
+            {"INFO"},
+            f"Check: max von Mises {_format_stress(max_stress)}, max displacement "
+            f"{_format_length(result.max_displacement)} ({int(problem.domain.sum())} voxels)",
+        )
+        return {"FINISHED"}
+
+
 # ================================================================= housekeeping
 class STRESS_SCULPT_OT_cancel(Operator):
     bl_idname = "stress_sculpt.cancel"
@@ -1880,8 +4536,9 @@ class STRESS_SCULPT_OT_clear_results(Operator):
                 bpy.data.collections.remove(collection)
         jobs.clear_cache(scene)
         settings = scene.stress_sculpt
-        if settings.domain is not None:
-            settings.domain.display_type = "TEXTURED"
+        for obj in (settings.domain, settings.target):
+            if obj is not None and obj.display_type == "WIRE":
+                obj.display_type = "TEXTURED"
         _set_last(scene, "")
         self.report({"INFO"}, f"Removed {removed} result object(s)")
         return {"FINISHED"}
@@ -2132,7 +4789,9 @@ class STRESS_SCULPT_OT_variant_save(Operator):
         )
         if not sources:
             self.report(
-                {"ERROR"}, "Nothing to save: run Analyze, Evolve, Lines, Sculpt or Relief first"
+                {"ERROR"},
+                "Nothing to save: generate a structure first (or run Analyze, Evolve, Lines, "
+                "Sculpt or Relief)",
             )
             return {"CANCELLED"}
         number = _variant_number(settings)
@@ -2321,7 +4980,13 @@ classes = (
     STRESS_SCULPT_OT_add_zone,
     STRESS_SCULPT_OT_set_role,
     STRESS_SCULPT_OT_select_role,
+    STRESS_SCULPT_OT_set_target,
+    STRESS_SCULPT_OT_add_load_at_selection,
+    STRESS_SCULPT_OT_add_support_at_selection,
+    STRESS_SCULPT_OT_remove_role,
     STRESS_SCULPT_OT_demo_scene,
+    STRESS_SCULPT_OT_generate,
+    STRESS_SCULPT_OT_verify,
     STRESS_SCULPT_OT_analyze,
     STRESS_SCULPT_OT_evolve,
     STRESS_SCULPT_OT_trace_lines,

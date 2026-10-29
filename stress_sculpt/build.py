@@ -34,6 +34,7 @@ OBJ_LINES_TENSION = "SS_Lines_Tension"
 OBJ_LINES_COMPRESSION = "SS_Lines_Compression"
 OBJ_SCULPTURE = "SS_Sculpture"
 OBJ_RELIEF = "SS_Relief"
+OBJ_STRUCTURE = "SS_Structure"
 RESULT_OBJECTS = (
     OBJ_STRESS,
     OBJ_EVOLVED,
@@ -41,16 +42,20 @@ RESULT_OBJECTS = (
     OBJ_LINES_COMPRESSION,
     OBJ_SCULPTURE,
     OBJ_RELIEF,
+    OBJ_STRUCTURE,
 )
 
 MAT_HEATMAP = "SS_Heatmap"
 MAT_TENSION = "SS_Tension"
 MAT_COMPRESSION = "SS_Compression"
 MAT_SCULPTURE = "SS_Sculpture"
+MAT_STRUCTURE = "SS_Structure"
 
 TENSION_COLOR = (0.92, 0.25, 0.06, 1.0)
 COMPRESSION_COLOR = (0.07, 0.32, 0.92, 1.0)
 CLAY_COLOR = (0.74, 0.56, 0.42, 1.0)
+STONE_COLOR = (0.80, 0.78, 0.74, 1.0)  # light concrete / limestone
+STRUCTURE_TINT = 0.25  # share of the force colors in the structure material
 SUPPORT_COLOR = (0.1, 0.35, 1.0, 1.0)
 LOAD_COLOR = (1.0, 0.12, 0.08, 1.0)
 
@@ -691,6 +696,29 @@ def sculpture_material():
     return material
 
 
+def structure_material():
+    """``SS_Structure``: light stone / concrete showing the force colors subtly.
+
+    25% of the "Stress" color attribute is mixed into an off-white base, so the
+    structure reads as one material while the most loaded members glow warmer.
+    """
+    material, created = _new_material(MAT_STRUCTURE)
+    if created:
+        nodes, links, bsdf = _principled(material, STONE_COLOR, 0.6)
+        node, color = _color_attribute_node(nodes, STRESS_COLOR_ATTRIBUTE)
+        node.location = (-700.0, 100.0)
+        mix, _fac, stone_in, stress_in, result = _mix_node(nodes, STRUCTURE_TINT)
+        mix.location = (-450.0, 100.0)
+        if stone_in is not None:
+            stone_in.default_value = STONE_COLOR
+        if stress_in is not None and color is not None:
+            links.new(color, stress_in)
+        base = _input(bsdf, "Base Color")
+        if base is not None and result is not None:
+            links.new(result, base)
+    return material
+
+
 def _set_materials(data, materials) -> None:
     data.materials.clear()
     for material in materials:
@@ -733,6 +761,13 @@ def assign_result(scene, name, data, material=None, view_layer=None):
     obj.hide_viewport = False
     set_hidden(obj, False, view_layer)
     return obj
+
+
+def set_result_material(obj, material) -> None:
+    """Replace the materials of a result object with ``material``."""
+    if obj is None or obj.data is None or not hasattr(obj.data, "materials"):
+        return
+    _set_materials(obj.data, [material])
 
 
 def remove_result(scene, name) -> bool:
