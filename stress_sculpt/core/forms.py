@@ -472,6 +472,11 @@ def grow_tree(
         in_dir[b] = _unit(world_nodes[b] - world_nodes[a])
     organic = float(np.clip(st.organic, 0.0, 1.0))
     samples = max(2, int(st.samples))
+    # largest child radius of every node: a member narrows into it before the split
+    out_r = np.zeros(n)
+    np.maximum.at(out_r, edges[:, 0], radii)
+    in_r = np.zeros(n)
+    in_r[edges[:, 1]] = radii
     curves, curve_r = [], []
     for e, (a, b) in enumerate(edges):
         p0, p1 = world_nodes[a], world_nodes[b]
@@ -480,11 +485,19 @@ def grow_tree(
         cdir = _unit(chord)
         t0 = _unit((1 - organic) * cdir + organic * (up if kind[a] == 0 else in_dir[a]))
         t1 = _unit((1 - 0.6 * organic) * cdir + 0.6 * organic * up) if kind[b] == 2 else cdir
+        if kind[a] == 1:
+            # branches emerge from inside the parent member: no collar at the split
+            p0 = p0 - in_dir[a] * (0.6 * in_r[a])
+            L = float(np.linalg.norm(p1 - p0))
         curve = _hermite(p0, p1, t0 * L, t1 * L, samples)
         s = np.linspace(0.0, 1.0, samples)
         r = np.full(samples, radii[e])
         if kind[a] == 0:  # footing flare over the first ~25% of the trunk
             r *= 1.0 + (float(st.footing_flare) - 1.0) * _smoothstep(1.0 - s / 0.25)
+        if kind[b] == 1 and out_r[b] < radii[e]:
+            # narrow towards the split, down to the thickest branch it feeds
+            target = max(out_r[b] * 1.08, 0.75 * radii[e])
+            r = r - (radii[e] - target) * _smoothstep((s - 0.7) / 0.3)
         if kind[b] == 2:  # trumpet-shaped capital over the last ~35% of the branch
             r *= 1.0 + (float(st.capital_flare) - 1.0) * _smoothstep((s - 0.6) / 0.4) ** 1.3
             # run into the carried object so the tube's round end stays hidden inside it
