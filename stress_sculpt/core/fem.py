@@ -64,6 +64,7 @@ by concurrent calls).
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import partial
 import threading
 import time
 from typing import Optional
@@ -610,11 +611,30 @@ def _assembled_diagonal(edof, ke_diag, scale, n_dofs):
 # The work decomposition of the threaded kernels depends on the model geometry only,
 # never on the number of threads: results are bit-for-bit identical for any thread
 # count (and deterministic from run to run).
-_SLAB_TARGET = 4096  # elements per box of the structured kernel (cache sized)
+_SLAB_TARGET = 16384  # elements per box of the structured kernel
+_SERIAL_ELEMS = 32768  # levels with at most this many grid elements run in one task
+_MIN_SLABS = 16  # large levels are cut into at least this many slabs (8 per colour) ...
+_SLAB_MIN_ELEMS = 8192  # ... unless slabs would get smaller than this (thread overhead)
 _GEMM_COLS = 128  # columns per BLAS call: 24 * 24 * 128 keeps OpenBLAS single-threaded
 _MIN_BOX_FILL = 0.35  # structured kernel when active / computed elements >= this
-_VEC_CHUNK = 1 << 16  # elements per chunk of the threaded vector operations
-_LOCAL_NODES = tuple(tuple(int(v) for v in off) for off in HEX_NODE_OFFSETS)
+_VEC_CHUNK = 1 << 17  # elements per chunk of the threaded vector operations
+# The kernels number the 8 local nodes lexicographically, (di, dj, dk) = (L>>2, L>>1&1,
+# L&1), so that one strided view gathers all of them; ``_LEX_DOFS`` maps those element
+# dofs to the HEX_NODE_OFFSETS order of ``KE`` (``KE_lex = KE[_LEX_DOFS][:, _LEX_DOFS]``).
+_LOCAL_NODES = tuple((di, dj, dk) for di in (0, 1) for dj in (0, 1) for dk in (0, 1))
+_LEX_DOFS = np.array(
+    [
+        3 * [tuple(int(v) for v in o) for o in HEX_NODE_OFFSETS].index(off) + c
+        for off in _LOCAL_NODES
+        for c in range(3)
+    ],
+    dtype=np.int64,
+)
+
+
+def _lex_ke(ke: np.ndarray) -> np.ndarray:
+    """Element stiffness with rows / columns in the kernels' local node order."""
+    return np.ascontiguousarray(ke[np.ix_(_LEX_DOFS, _LEX_DOFS)])
 
 
 class _Workers:
@@ -747,6 +767,11 @@ def _ew_copy(dst, src):
     np.copyto(dst, src)
 
 
+def _ew_scaled_cast(dst, src, factor):  # dst = src * factor (float64 math, dst's precision)
+    dt = np.promote_types(dst.dtype, src.dtype)
+    np.multiply(src, factor, out=dst, dtype=dt, casting="same_kind")
+
+
 class _Buffers:
     """Scratch ``(24, width)`` array pairs of the element kernels (one per running task)."""
 
@@ -811,18 +836,28 @@ def _padded(m: int) -> int:
 class _Box:
     """Sub-grid of elements handled at once by the structured kernel."""
 
-    __slots__ = ("shape", "m", "cols", "elem", "nodes", "ue_shape")
+    __slots__ = ("shape", "m", "cols", "elem", "origin", "nodes", "ue_shape")
 
     def __init__(self, lo, hi):
         self.shape = tuple(int(h - l) for l, h in zip(lo, hi))
         self.m = int(np.prod(self.shape))
         self.cols = _padded(self.m)
         self.elem = tuple(slice(int(l), int(h)) for l, h in zip(lo, hi))
+        self.origin = (slice(None),) + tuple(slice(int(l), None) for l in lo)
         self.nodes = tuple(
             (slice(None),) + tuple(slice(int(l) + o, int(h) + o) for l, h, o in zip(lo, hi, off))
             for off in _LOCAL_NODES
         )
-        self.ue_shape = (24,) + self.shape
+        self.ue_shape = (2, 2, 2, 3) + self.shape
+
+    def node_view(self, x4: np.ndarray) -> np.ndarray:
+        """Read-only view ``(2, 2, 2, 3, t0, t1, t2)``: [di, dj, dk, c, i, j, k] =
+        ``x4[c, i0 + i + di, j0 + j + dj, k0 + k + dk]`` (all 8 local nodes at once)."""
+        base = x4[self.origin]
+        sc, sx, sy, sz = base.strides
+        return np.lib.stride_tricks.as_strided(
+            base, shape=self.ue_shape, strides=(sx, sy, sz, sc, sx, sy, sz), writeable=False
+        )
 
 
 class _Slab:
@@ -867,14 +902,19 @@ class _ElementLoops:
     # ---------------------------------------------------------------- planning
     def _plan(self) -> None:
         shape = self.shape
-        ax = int(np.argmax(shape))
+        # Slabs along x or y, whichever is longer, so that boxes keep the whole z extent
+        # as the contiguous inner loop; z only for thin columns.
+        ax = 0 if shape[0] >= shape[1] else 1
+        if shape[ax] < 8 and shape[2] > 2 * shape[ax]:
+            ax = 2
         b1, b2 = [a for a in range(3) if a != ax]
         n_ax = shape[ax]
         cross = shape[b1] * shape[b2]
-        if self.n_elems <= 2 * _SLAB_TARGET:
+        if self.n_elems <= _SERIAL_ELEMS:
             t = n_ax  # small level: one slab, no threading overhead
         else:
-            t = max(1, min(_SLAB_TARGET // max(1, cross), -(-n_ax // 16)))
+            n_slabs = max(2, min(_MIN_SLABS, self.n_elems // _SLAB_MIN_ELEMS))
+            t = max(1, min(_SLAB_TARGET // max(1, cross), -(-n_ax // n_slabs)))
         act = np.zeros(self.n_elems, dtype=bool)
         act[self.elems] = True
         act = act.reshape(shape)
@@ -882,7 +922,7 @@ class _ElementLoops:
         rows = max(1, _SLAB_TARGET // max(1, t * shape[b2]))
         slabs = []
         computed = 0
-        for si, lo in enumerate(range(0, n_ax, t)):
+        for lo in range(0, n_ax, t):
             hi = min(n_ax, lo + t)
             slab = _Slab()
             for r0 in range(0, shape[b1], rows):
@@ -904,12 +944,12 @@ class _ElementLoops:
                 computed += box.m
             if slab.boxes:
                 slab.cols = max(b.cols for b in slab.boxes)
-            slabs.append((si, lo, hi, slab))
+            slabs.append(slab)  # every slab, also empty ones: the parity is its position
         self.fill = self.n_act / float(max(1, computed))
         if self.fill < _MIN_BOX_FILL:
             self.structured = False
             self._plan_indexed(ax, t, slabs)
-        for si, lo, hi, slab in slabs:
+        for si, slab in enumerate(slabs):
             if slab.boxes or slab.chunks:
                 self.colors[si % 2].append(slab)
                 self.slabs.append(slab)
@@ -924,7 +964,7 @@ class _ElementLoops:
             [self.nodes_shape[1] * self.nodes_shape[2], self.nodes_shape[2], 1], dtype=np.int64
         )
         local = np.array([int(np.dot(off, strides)) for off in _LOCAL_NODES], dtype=np.int64)
-        for k, (si, lo, hi, slab) in enumerate(slabs):
+        for k, slab in enumerate(slabs):  # slab k holds the elements with slab_of == k
             slab.boxes = []
             pos_all = order[bounds[k] : bounds[k + 1]]
             for s in range(0, pos_all.size, _SLAB_TARGET):
@@ -944,7 +984,10 @@ class _ElementLoops:
         return np.ascontiguousarray(scale_act, dtype=dtype)
 
     def apply(self, x: np.ndarray, sc: np.ndarray, ke: np.ndarray, out: np.ndarray) -> np.ndarray:
-        """``out = sum_e s_e KE x_e`` (SoA vectors of ``ke``'s dtype, nothing masked)."""
+        """``out = sum_e s_e KE x_e`` (SoA vectors of ``ke``'s dtype, nothing masked).
+
+        ``ke`` must be in the kernels' local node order (:func:`_lex_ke`).
+        """
         out.fill(0.0)
         if not self.n_act:
             return out
@@ -961,15 +1004,13 @@ class _ElementLoops:
             for box in slab.boxes:
                 ue = ue_b[:, : box.cols]
                 fe = fe_b[:, : box.cols]
-                ue4 = ue[:, : box.m].reshape(box.ue_shape)
-                s = sgrid[box.elem]
-                for a in range(8):
-                    np.multiply(x4[box.nodes[a]], s, out=ue4[3 * a : 3 * a + 3])
+                gathered = ue[:, : box.m].reshape(box.ue_shape)
+                np.multiply(box.node_view(x4), sgrid[box.elem], out=gathered)
                 _gemm(ke, ue, fe)
-                fe4 = fe[:, : box.m].reshape(box.ue_shape)
+                fe8 = fe[:, : box.m].reshape((8, 3) + box.shape)
                 for a in range(8):
                     yv = y4[box.nodes[a]]
-                    np.add(yv, fe4[3 * a : 3 * a + 3], out=yv)
+                    np.add(yv, fe8[a], out=yv)
         finally:
             self.buffers.put((ue_b, fe_b))
 
@@ -1000,7 +1041,8 @@ class _ElementLoops:
         if not self.n_act:
             return np.zeros(0) if energy else np.zeros((0, k))
         x4 = x.reshape((3,) + self.nodes_shape)
-        mat = np.ascontiguousarray(mat, dtype=np.float64)
+        mat = np.asarray(mat, dtype=np.float64)
+        mat = _lex_ke(mat) if energy else np.ascontiguousarray(mat[:, _LEX_DOFS])
         if self.structured:
             grid = np.zeros((k,) + self.shape, dtype=np.float64)
 
@@ -1010,9 +1052,7 @@ class _ElementLoops:
                     for box in slab.boxes:
                         ue = ue_b[:, : box.cols]
                         fe = fe_b[:, : box.cols]
-                        ue4 = ue[:, : box.m].reshape(box.ue_shape)
-                        for a in range(8):
-                            np.copyto(ue4[3 * a : 3 * a + 3], x4[box.nodes[a]])
+                        np.copyto(ue[:, : box.m].reshape(box.ue_shape), box.node_view(x4))
                         _gemm(mat, ue, fe)
                         dst = grid[(slice(None),) + box.elem]
                         if energy:
@@ -1136,8 +1176,6 @@ class _LevelOp:
     ke: Optional[np.ndarray] = None  # level stiffness in ``dtype``
     sc: Optional[np.ndarray] = None  # element scales in the kernel layout (``dtype``)
     coarse: Optional["_DenseCholesky"] = None  # coarsest level: Cholesky factor of K
-    coarse_matrix: Optional[np.ndarray] = None  # coarsest level: assembled K (free dofs)
-    coarse_reg: float = 0.0  # diagonal regularization that made K factorizable
     coarse_idx: Optional[np.ndarray] = None  # coarsest level: free dof ids (component-major)
 
     @property
@@ -1382,6 +1420,35 @@ def _lanczos_lambda_max(apply, v0, d_isqrt, steps: int, should_stop=None, dot=No
     return float(np.linalg.eigvalsh(T)[-1])
 
 
+_COARSE_REGULARIZATION = (1e-12, 1e-10, 1e-8, 1e-6)  # relative to mean(diag(K))
+
+
+def _assemble_dense(level: _Level, scale: np.ndarray, free_nm: np.ndarray) -> tuple:
+    """Dense stiffness of the free dofs of a (coarsest) level.
+
+    Returns ``(idx, K)``: node-major free dof ids and the symmetric matrix (``None``
+    when there is no free dof); raises ``_MGSetupError`` for a degenerate matrix.
+    """
+    idx = np.flatnonzero(free_nm)
+    nf = int(idx.size)
+    if nf == 0:
+        return idx, None
+    g2f = np.full(level.n_dofs, -1, dtype=np.int64)
+    g2f[idx] = np.arange(nf)
+    loc = g2f[level.edof]  # (n_act, 24) free index or -1
+    rows = np.broadcast_to(loc[:, :, None], (loc.shape[0], 24, 24))
+    cols = np.broadcast_to(loc[:, None, :], (loc.shape[0], 24, 24))
+    ok = (rows >= 0) & (cols >= 0)
+    vals = scale[:, None, None] * level.ke[None, :, :]
+    K = np.bincount((rows[ok] * nf + cols[ok]), weights=vals[ok], minlength=nf * nf)
+    K = K.reshape(nf, nf)
+    K = 0.5 * (K + K.T)
+    mean_diag = float(np.mean(np.diag(K)))
+    if not (mean_diag > 0.0 and np.isfinite(mean_diag)):
+        raise _MGSetupError("coarsest multigrid matrix is degenerate")
+    return idx, K
+
+
 def _torch_failure_message(exc: BaseException) -> str:
     text = str(exc).strip().splitlines()
     detail = text[0][:300] if text else ""
@@ -1449,6 +1516,7 @@ class FEModel:
         self.edof = g.element_dofs(self.elems)
         self._edof_flat = self.edof.ravel()
         self.KE = problem.E * g.h * hex8_ke(problem.nu)
+        self._ke_lex = _lex_ke(self.KE)  # local node order of the element kernels
         self._ke_diag = np.diag(self.KE).copy()
         fixed = np.zeros(self.n_dofs, dtype=bool)
         fixed[_valid_fixed_dofs(problem)] = True
@@ -1535,7 +1603,7 @@ class FEModel:
         y = loops.apply(
             self._soa_input(u),
             loops.scale_context(scale, np.float64),
-            self.KE,
+            self._ke_lex,
             np.empty(self.n_dofs, dtype=np.float64),
         )
         y = _aos(y)
@@ -1669,7 +1737,7 @@ class FEModel:
             if li == len(levels) - 1:
                 self._factor_coarsest(level, op, free_l)
             else:
-                op.ke = np.ascontiguousarray(level.ke, dtype=dt)
+                op.ke = _lex_ke(level.ke).astype(dt)
                 op.sc = level.loops.scale_context(scale_l, dt)
                 if opts.omega is not None:
                     omega = float(opts.omega)
@@ -1698,34 +1766,18 @@ class FEModel:
         return ops
 
     def _factor_coarsest(self, level: _Level, op: _LevelOp, free_nm: np.ndarray) -> None:
-        idx = np.flatnonzero(free_nm)
+        idx, K = _assemble_dense(level, op.scale, free_nm)
         op.coarse_idx = _soa_index(idx, level.n_nodes)
-        nf = int(idx.size)
-        if nf == 0:
-            op.coarse = None
+        op.coarse = None
+        if K is None:
             return
-        g2f = np.full(level.n_dofs, -1, dtype=np.int64)
-        g2f[idx] = np.arange(nf)
-        loc = g2f[level.edof]  # (n_act, 24) free index or -1
-        rows = np.broadcast_to(loc[:, :, None], (loc.shape[0], 24, 24))
-        cols = np.broadcast_to(loc[:, None, :], (loc.shape[0], 24, 24))
-        ok = (rows >= 0) & (cols >= 0)
-        vals = op.scale[:, None, None] * level.ke[None, :, :]
-        K = np.bincount(
-            (rows[ok] * nf + cols[ok]), weights=vals[ok], minlength=nf * nf
-        ).reshape(nf, nf)
-        K = 0.5 * (K + K.T)
         mean_diag = float(np.mean(np.diag(K)))
-        if not (mean_diag > 0.0 and np.isfinite(mean_diag)):
-            raise _MGSetupError("coarsest multigrid matrix is degenerate")
-        eye = np.eye(nf)
-        for reg in (1e-12, 1e-10, 1e-8, 1e-6):
+        eye = np.eye(K.shape[0])
+        for reg in _COARSE_REGULARIZATION:
             try:
                 op.coarse = _DenseCholesky(K + (reg * mean_diag) * eye, self._workers)
             except np.linalg.LinAlgError:
                 continue
-            op.coarse_matrix = K  # assembled matrix (the PyTorch backend factors it again)
-            op.coarse_reg = reg * mean_diag
             return
         raise _MGSetupError("coarsest multigrid matrix is not positive definite")
 
@@ -1878,7 +1930,7 @@ class FEModel:
         b = _soa(b_nm)
         jacobi_dinv = freef / np.where(free_s, _soa(diag), 1.0)
         sc64 = loops.scale_context(scale, np.float64)
-        ke64 = self.KE
+        ke64 = self._ke_lex
 
         def apply(v):
             y = loops.apply(v, sc64, ke64, np.empty(n, dtype=np.float64))
@@ -1911,10 +1963,9 @@ class FEModel:
                         if not (nrm > 0.0 and np.isfinite(nrm)):
                             z.fill(0.0 if nrm == 0.0 else np.nan)
                             return z
-                        inv = 1.0 / nrm
-                        vec.each(lambda d, s: np.multiply(s, inv, out=d, casting="same_kind"), r32, v)
+                        vec.each(partial(_ew_scaled_cast, factor=1.0 / nrm), r32, v)
                         z32 = self._vcycle(levels, ops, 0, r32, should_stop)
-                        vec.each(lambda d, s: np.multiply(s, nrm, out=d, dtype=np.float64), z, z32)
+                        vec.each(partial(_ew_scaled_cast, factor=nrm), z, z32)
                         return z
 
                     flexible = True
@@ -1965,7 +2016,7 @@ class FEModel:
                     breakdown = True  # K is singular along p (mechanism) or not finite
                     break
                 alpha = rz / pq
-                vec.each(lambda x_, r_, p_, q_: (_axpy(x_, alpha, p_), _axpy(r_, -alpha, q_)), x, r, p, q)
+                vec.each(partial(_cg_update, alpha=alpha), x, r, p, q)
                 it += 1
                 rel = vec.norm(r) / bnorm
                 if not np.isfinite(rel):
@@ -1994,7 +2045,7 @@ class FEModel:
                     beta = -alpha * vec.dot(z, q) / rz
                 else:
                     beta = rz_new / rz
-                vec.each(lambda p_, z_: _xpby(p_, z_, beta), p, z)
+                vec.each(partial(_xpby, beta=beta), p, z)
                 rz = rz_new
                 if progress is not None:
                     now = time.perf_counter()
@@ -2033,6 +2084,11 @@ class FEModel:
 def _axpy(y, a, x):  # y += a * x
     t = x * a
     y += t
+
+
+def _cg_update(x, r, p, q, alpha):  # x += alpha p, r -= alpha q
+    _axpy(x, alpha, p)
+    _axpy(r, -alpha, q)
 
 
 def _xpby(p, z, beta):  # p = z + beta * p

@@ -30,11 +30,14 @@ except ImportError:  # numpy core used outside Blender (unit tests, scripts)
 # Submodules in dependency order (used for reloading with "Reload Scripts").
 _SUBMODULES = (
     "core.grid",
+    "core.backend",
     "core.fem",
+    "core.fem_torch",
     "core.topopt",
     "core.mesher",
     "core.sculpt",
     "core.streamlines",
+    "preferences",
     "props",
     "jobs",
     "scene_io",
@@ -58,9 +61,9 @@ if bpy is not None:
     if "props" in locals():
         _reload_submodules()
 
-    from . import props, jobs, operators, ui  # noqa: E402
+    from . import preferences, props, jobs, operators, ui  # noqa: E402
 
-    _REGISTER_ORDER = (props, operators, ui)
+    _REGISTER_ORDER = (preferences, props, operators, ui)  # preferences first, unregistered last
 
 
 def register():

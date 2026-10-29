@@ -14,15 +14,7 @@ import bpy
 import bmesh
 from bhelpers import box, empty, mesh_attribute_values, require
 
-from stress_sculpt import build, jobs, operators, scene_io
-
-
-def _ribs_available():
-    try:
-        from stress_sculpt.core import streamlines
-    except ImportError:
-        return False
-    return operators.ribs_supported(streamlines)
+from stress_sculpt import build, jobs, operators
 
 
 def _topopt_available():
@@ -35,7 +27,8 @@ def _topopt_available():
 
 def require_style(style, mode="SUPPORT", rib_source="EVOLVED"):
     require("fem", "mesher", "sculpt", "forms")
-    if style == "ORGANIC" or (style == "RIBS" and not (mode == "CARVE" and rib_source == "SURFACE")):
+    block_ribs = style == "RIBS" and mode == "CARVE" and rib_source == "SURFACE"
+    if style == "ORGANIC" or (style == "RIBS" and not block_ribs):
         if not _topopt_available():
             pytest.skip("core/topopt.py not available yet")
     if style == "RIBS":
@@ -129,11 +122,11 @@ def test_weights_on_selected_vertices(scene):
     require("forms")
     cube = _floating_cube(size=2.0, bottom=3.0)
     bpy.context.view_layer.update()
-    _select_verts(cube, lambda co, _v: co.z < 0.0 and co.x > 0.0 or (co.z < 0 and co.y > 0.5))
+    _select_verts(cube, lambda co, _v: co.z < 0.0)  # the 4 bottom corners
     assert bpy.ops.stress_sculpt.add_load_at_selection(force=1500.0) == {"FINISHED"}
     assert bpy.context.mode == "EDIT_MESH"  # stays in Edit Mode
     loads = _loads(scene)
-    assert len(loads) == 3
+    assert len(loads) == 4
     bpy.context.view_layer.update()
     setup = build.find_child_collection(scene.collection, build.SETUP_COLLECTION)
     diagonal = math.sqrt(3.0 * 4.0)
@@ -155,11 +148,14 @@ def test_weights_on_selected_vertices(scene):
     cube.location.x += 1.0
     bpy.context.view_layer.update()
     after = np.array([tuple(o.matrix_world.translation) for o in loads])
-    assert after - before == pytest.approx(np.tile([1.0, 0.0, 0.0], (3, 1)), abs=1e-5)
+    assert after - before == pytest.approx(np.tile([1.0, 0.0, 0.0], (4, 1)), abs=1e-5)
     # repeated calls add more (Object Mode uses the stored selection)
     bpy.context.view_layer.objects.active = cube
-    assert bpy.ops.stress_sculpt.add_load_at_selection() == {"FINISHED"}
-    assert len(_loads(scene)) == 6
+    assert bpy.ops.stress_sculpt.add_load_at_selection(distribute="TOTAL", force=100.0) == {
+        "FINISHED"
+    }
+    assert len(_loads(scene)) == 8
+    assert sum(o.stress_sculpt.magnitude for o in _loads(scene)[4:]) == pytest.approx(100.0)
 
 
 def test_weights_total_on_faces_and_into_surface(scene):
@@ -325,7 +321,9 @@ def _fast(settings):
     settings.rib_spacing = 2.0
 
 
-COMBOS = [(mode, style) for mode in ("SUPPORT", "CARVE") for style in ("ORGANIC", "BRANCHING", "RIBS")]
+COMBOS = [
+    (mode, style) for mode in ("SUPPORT", "CARVE") for style in ("ORGANIC", "BRANCHING", "RIBS")
+]
 
 
 @pytest.mark.parametrize("mode,style", COMBOS)
@@ -411,7 +409,7 @@ def test_branching_support_contacts_and_footings(scene):
 
 def test_branching_with_explicit_footings(scene):
     require_style("BRANCHING")
-    settings = _support_setup({"structure_style": "BRANCHING"})
+    _support_setup({"structure_style": "BRANCHING"})
     ground = box("Ground", size=(4.0, 4.0, 0.2), location=(0.0, 0.0, -0.1))
     bpy.context.view_layer.update()
     operators.add_role_empties(
@@ -550,7 +548,7 @@ def test_demo_presets_generate(scene, preset):
     settings = scene.stress_sculpt
     assert bpy.ops.stress_sculpt.demo_scene(preset=preset) == {"FINISHED"}
     require_style(style, mode, settings.rib_source)
-    settings.resolution = 16
+    settings.resolution = 28
     settings.max_iterations = 10
     settings.tree_detail = 1.5
     settings.sculpt_detail = 1.0
@@ -582,3 +580,33 @@ def test_floating_cube_default_is_fast_and_clean(scene):
     top = verts[verts[:, 2] > 2.9]
     assert np.all(np.abs(top[:, :2]) <= 1.0 + 0.02)
     assert cube_min is not None
+
+
+def test_ribs_reuse_the_cached_organic_shape(scene):
+    require_style("RIBS")
+    settings = _support_setup({"structure_style": "ORGANIC"})
+    assert bpy.ops.stress_sculpt.generate() == {"FINISHED"}
+    organic = jobs.get_cache(scene).structure
+    assert organic["kind"] == "ORGANIC" and organic["state"] is not None
+    evolution = jobs.get_cache(scene).evolution
+    assert evolution is not None and evolution["state"] is organic["state"]  # line tools
+    settings.structure_style = "RIBS"
+    assert bpy.ops.stress_sculpt.generate() == {"FINISHED"}
+    ribs = jobs.get_cache(scene).structure
+    assert ribs["kind"] == "RIBS" and ribs["state"] is organic["state"]  # not optimized again
+    assert settings.last_kind == "RIBS"
+    # a changed setup optimizes again
+    settings.support_material = 0.1
+    assert bpy.ops.stress_sculpt.generate() == {"FINISHED"}
+    assert jobs.get_cache(scene).structure["state"] is not organic["state"]
+
+
+def test_generate_keeps_the_last_state_when_cancelled(scene):
+    require_style("ORGANIC")
+    settings = _support_setup({"structure_style": "ORGANIC"})
+    request = operators.structure_request(bpy.context, settings)
+    snapshots = []
+    output = operators.structure_compute(request, lambda *a: None, None, snapshots.append)
+    assert snapshots and snapshots[-1]["state"].iteration == output["state"].iteration
+    partial = operators._structure_partial(snapshots[0])
+    assert partial["state"].iteration == 1 and partial["kind"] == "ORGANIC"

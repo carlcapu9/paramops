@@ -1237,12 +1237,12 @@ def grid_box_mesh(name, size, divisions):
     """
     n = [max(1, int(d)) for d in divisions]
     axes = [np.linspace(-0.5 * s, 0.5 * s, d + 1) for s, d in zip(size, n)]
-    I, J, K = np.meshgrid(*(np.arange(d + 1) for d in n), indexing="ij")
-    surface = (I == 0) | (I == n[0]) | (J == 0) | (J == n[1]) | (K == 0) | (K == n[2])
-    index = -np.ones(I.shape, dtype=np.int64)
+    gi, gj, gk = np.meshgrid(*(np.arange(d + 1) for d in n), indexing="ij")
+    surface = (gi == 0) | (gi == n[0]) | (gj == 0) | (gj == n[1]) | (gk == 0) | (gk == n[2])
+    index = -np.ones(gi.shape, dtype=np.int64)
     index[surface] = np.arange(int(surface.sum()))
     verts = np.stack(
-        [axes[0][I[surface]], axes[1][J[surface]], axes[2][K[surface]]], axis=1
+        [axes[0][gi[surface]], axes[1][gj[surface]], axes[2][gk[surface]]], axis=1
     )
     faces = []
 
@@ -1421,13 +1421,14 @@ def demo_layout(preset) -> dict:
                 "structure_style": "ORGANIC",
                 "resolution": 56,
                 "max_iterations": 40,
-                "volume_fraction": 0.18,
+                "volume_fraction": 0.2,
                 "filter_radius": 1.5,
                 "symmetry_x": True,
                 "symmetry_y": True,
                 "symmetry_z": False,
             },
-            "load_radius": 0.5,
+            # the deck: a thin layer along the top always stays solid
+            "zones": [("SS_Deck", "KEEP_SOLID", (0.0, 0.0, 1.25 - 0.08), (4.0, 0.6, 0.08))],
         }
     if preset == "CARVED_CUBE":
         size = (2.0, 2.0, 2.0)
@@ -1451,8 +1452,8 @@ def demo_layout(preset) -> dict:
                 "symmetry_x": True,
                 "symmetry_y": True,
                 "symmetry_z": False,
-                "rib_spacing": 1.5,
-                "rib_thickness": 0.45,
+                "rib_spacing": 2.5,
+                "rib_thickness": 0.6,
                 "rib_min_thickness": 0.8,
             },
         }
@@ -1576,6 +1577,21 @@ class STRESS_SCULPT_OT_demo_scene(Operator):
             voxel = longest / max(int(layout["settings"].get("resolution", 40)), 1)
             size = max(1.5 * voxel, 0.03 * diagonal)
             created += add_role_empties(context, target, "SUPPORT", to_world(supports), size=size)
+        for name, role, location, half in layout.get("zones", ()):
+            zone = new_role_empty(
+                scene,
+                name,
+                role,
+                "CUBE",
+                1.0,
+                to_world(np.asarray(location, dtype=np.float64)[None, :])[0],
+                rotation=(0.0, 0.0, layout["rotation_z"]),
+                scale=half,
+                color=ZONE_COLORS.get(role),
+            )
+            zone.parent = target
+            zone.matrix_parent_inverse = target.matrix_world.inverted()
+            created.append(zone)
         for obj in created:
             obj[DEMO_TAG] = self.preset
 
@@ -2374,6 +2390,8 @@ ORGANIC_UPSAMPLE = 2  # the optimized density is meshed on a grid this much fine
 ORGANIC_BLUR = 2  # [1, 2, 1] passes over that finer grid (rounds the voxel facets)
 ORGANIC_OPENING = 0  # grey opening radius in fine voxels: removes webs thinner than that
 MEMBER_TAPER = 1.15  # a member ends at this times its thickest child's radius
+RIB_SMOOTHING = 2.0  # voxels: the ribs are smoothed over this length (surface mode)
+RIB_TRIM = True  # ribs run between junctions (dangling ends trimmed, loose ribs dropped)
 RIB_END_TAPER = 0.4  # open rib ends taper to this share of their radius ...
 RIB_END_SPAN = 0.1  # ... over this share of their length
 # ID properties stored on SS_Structure (read back by "Check Generated Structure")
@@ -3065,33 +3083,86 @@ def ribs_supported(streamlines) -> bool:
     return "surface" in names and hasattr(streamlines, "SurfaceConstraint")
 
 
-def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3, join=0.0) -> list:
-    """Clean rib lattice: every rib runs between two connections.
+def clip_lines_z(lines, floor=None, ceiling=None, min_points=3) -> list:
+    """The parts of the lines between the heights ``floor`` and ``ceiling``."""
+    if floor is None and ceiling is None:
+        return list(lines)
+    out = []
+    for line in lines:
+        z = np.asarray(line.points)[:, 2]
+        keep = np.ones(z.shape[0], dtype=bool)
+        if floor is not None:
+            keep &= z >= float(floor)
+        if ceiling is not None:
+            keep &= z <= float(ceiling)
+        if keep.all():
+            out.append(line)
+            continue
+        edges = np.flatnonzero(np.diff(np.concatenate([[0], keep.astype(np.int8), [0]])))
+        for a, b in zip(edges[::2], edges[1::2]):
+            if b - a >= min_points:
+                out.append(
+                    dataclasses.replace(
+                        line,
+                        points=np.asarray(line.points)[a:b],
+                        magnitude=np.asarray(line.magnitude)[a:b],
+                        sign=np.asarray(line.sign)[a:b],
+                        closed=False,
+                    )
+                )
+    return out
 
-    A rib point is *connected* where another rib passes within ``connect`` or a
-    pad (``anchors``) within ``anchor_reach``. Open ribs are trimmed to the span
-    between their first and last connection, ribs (open or closed) with fewer
-    than two connections are dropped; repeated ``rounds`` times because removing
-    a rib can strand others. No spikes, no floating loops.
+
+def _tangents(points) -> np.ndarray:
+    pts = np.asarray(points, dtype=np.float64)
+    t = np.gradient(pts, axis=0) if pts.shape[0] > 1 else np.zeros_like(pts)
+    return t / np.maximum(np.linalg.norm(t, axis=1, keepdims=True), 1e-30)
+
+
+def trim_dangling(lines, anchors, connect, anchor_reach, rounds=8, join=0.0, min_runs=2,
+                  max_overhang=None) -> list:
+    """Clean rib lattice: every rib runs between two junctions.
+
+    A rib point is a *junction* where another rib crosses it (passes within
+    ``connect`` at more than 45 degrees, or touches it within half of that), where
+    the rib ends next to another rib (it stopped there), or where a pad
+    (``anchors``) lies within ``anchor_reach``; parallel neighbours do not count.
+    Open ribs are trimmed to the span between their first and last junction and
+    frame into the rib they meet; ribs with fewer than ``min_runs`` junctions are
+    dropped. With ``max_overhang`` (a length) only overhangs shorter than that are
+    trimmed (stubs), longer free ends stay. Repeated until nothing changes
+    (removing a rib can strand others).
     """
     lines = [line for line in lines if len(line.points) >= 2]
     anchors = np.asarray(anchors, dtype=np.float64).reshape(-1, 3)
+    cos_cross = math.cos(math.radians(45.0))
     for _ in range(int(rounds)):
         if not lines:
             break
         index = _PointHash(connect)
         for k, line in enumerate(lines):
-            index.add(line.points, [k] * len(line.points))
+            tangents = _tangents(line.points)
+            index.add(line.points, [(k, t) for t in tangents])
         changed = False
         kept = []
         for k, line in enumerate(lines):
             points = np.asarray(line.points)
-            gap = np.full(points.shape[0], np.inf)  # distance to the connection, scaled
-            partner = [None] * points.shape[0]
+            tangents = _tangents(points)
+            n = points.shape[0]
+            gap = np.full(n, np.inf)  # distance to the junction, relative to ``connect``
+            partner = [None] * n
             for i, point in enumerate(points):
-                distance, other = index.nearest(point, connect, skip=lambda tag, k=k: tag == k)
-                gap[i] = distance / connect
-                partner[i] = other
+                distance, other, tag = index.nearest_tagged(
+                    point, connect, skip=lambda tag, k=k: tag[0] == k
+                )
+                if other is None:
+                    continue
+                crossing = abs(float(tangents[i] @ tag[1])) < cos_cross
+                touching = distance < 0.5 * connect
+                end = i < 2 or i >= n - 2
+                if crossing or touching or end:
+                    gap[i] = distance / connect
+                    partner[i] = other
             if anchors.size:
                 dist = np.min(
                     np.linalg.norm(points[:, None, :] - anchors[None, :, :], axis=2), axis=1
@@ -3104,26 +3175,38 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3, join=0.0) -> 
             # contiguous runs count once: a crossing touches a few consecutive points
             breaks = np.flatnonzero(np.diff(hits) > 1)
             runs = int(breaks.size + 1) if hits.size else 0
-            if runs < 2:
+            if runs < max(int(min_runs), 1):
                 changed = True
                 continue
             if getattr(line, "closed", False):
                 kept.append(line)
                 continue
-            # end each rib where it is closest to its first / last connection (no stubs)
-            first = hits[: breaks[0] + 1]
-            last = hits[breaks[-1] + 1 :]
+            # end each rib where it is closest to its first / last junction (no stubs)
+            first = hits[: breaks[0] + 1] if breaks.size else hits
+            last = hits[breaks[-1] + 1 :] if breaks.size else hits
             a = int(first[np.argmin(gap[first])])
             b = int(last[np.argmin(gap[last])])
             if gap[0] == 0.0:  # starts on a pad
                 a = 0
             if gap[-1] == 0.0:
-                b = points.shape[0] - 1
+                b = n - 1
+            if max_overhang is not None:  # trim stubs only: long free ends stay
+                seg = np.linalg.norm(np.diff(points, axis=0), axis=1)
+                arc = np.concatenate([[0.0], np.cumsum(seg)])
+                if arc[a] > max_overhang:
+                    a = 0
+                if arc[-1] - arc[b] > max_overhang:
+                    b = n - 1
+                if b <= a:
+                    kept.append(line)
+                    continue
             pts = points[a : b + 1]
             mag = np.asarray(line.magnitude)[a : b + 1]
             # frame into the rib it meets: the end reaches that rib's axis, the jog is
             # smoothed into a curve
             joined = False
+            if max_overhang is not None:
+                partner = [None] * n  # gentle mode: the lattice already crosses
             if partner[a] is not None and float(np.linalg.norm(partner[a] - pts[0])) > join:
                 pts = np.vstack([partner[a][None, :], pts])
                 mag = np.concatenate([mag[:1], mag])
@@ -3134,7 +3217,7 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3, join=0.0) -> 
                 joined = True
             if joined:
                 pts = _smooth_polyline(pts, False, passes=6)
-            if pts.shape[0] != points.shape[0] or a > 0:
+            if pts.shape[0] != n or a > 0:
                 changed = True
             line = dataclasses.replace(
                 line, points=pts, magnitude=mag, sign=np.full(pts.shape[0], line.sign[0])
@@ -3218,12 +3301,19 @@ def connector_ribs(streamlines, lines, loads, footings, field, tensors, iso, ste
     return added
 
 
-def rib_tubes(lines, h, thickness, min_thickness, sculpt, anchors=None, anchor_radius=0.0) -> list:
+def rib_tubes(lines, h, thickness, min_thickness, sculpt, anchors=None, anchor_radius=0.0,
+              connect=0.0) -> list:
     """Tubes along the rib lines: radius ~ sqrt(|sigma|), tapered open ends.
 
-    Ends within ``anchor_radius`` of an ``anchors`` point (a load or support pad)
-    keep their full radius so they land on the pad.
+    Only free ends taper (to ``RIB_END_TAPER`` over the last ``RIB_END_SPAN`` of
+    the line): ends within ``anchor_radius`` of an ``anchors`` point (a load or
+    support pad) or within ``connect`` of another rib keep their full radius, so
+    they land on the pad / frame into the rib.
     """
+    others = _PointHash(max(float(connect), 1e-9)) if connect > 0.0 else None
+    if others is not None:
+        for k, line in enumerate(lines):
+            others.add(np.asarray(line.points), [k] * len(line.points))
     hi = float(thickness) * h
     lo = float(min_thickness) * hi
     magnitudes = [np.abs(np.asarray(line.magnitude, dtype=np.float64)) for line in lines]
@@ -3232,7 +3322,7 @@ def rib_tubes(lines, h, thickness, min_thickness, sculpt, anchors=None, anchor_r
     ref = float(np.percentile(flat, 99.0)) if flat.size else 1.0
     ref = ref if ref > 0.0 else 1.0
     tubes = []
-    for line, magnitude in zip(lines, magnitudes):
+    for k, (line, magnitude) in enumerate(zip(lines, magnitudes)):
         points = np.asarray(line.points, dtype=np.float64)
         if points.shape[0] < 2:
             continue
@@ -3249,6 +3339,12 @@ def rib_tubes(lines, h, thickness, min_thickness, sculpt, anchors=None, anchor_r
                 if np.min(np.linalg.norm(pads - points[0], axis=1)) <= anchor_radius:
                     w0 = np.ones_like(w0)
                 if np.min(np.linalg.norm(pads - points[-1], axis=1)) <= anchor_radius:
+                    w1 = np.ones_like(w1)
+            if others is not None:
+                skip = lambda tag, k=k: tag == k  # noqa: E731
+                if others.near(points[0], connect, skip=skip):
+                    w0 = np.ones_like(w0)
+                if others.near(points[-1], connect, skip=skip):
                     w1 = np.ones_like(w1)
             w = np.minimum(w0, w1)
             radius = radius * (RIB_END_TAPER + (1.0 - RIB_END_TAPER) * w * w * (3.0 - 2.0 * w))
@@ -3410,6 +3506,26 @@ class _PointHash:
         best = float(np.sqrt(best))
         return (best, where) if best <= radius else (np.inf, None)
 
+    def nearest_tagged(self, point, radius, skip=None) -> tuple:
+        """``(distance, point, tag)`` of the nearest stored point within ``radius``."""
+        key = self._key(point)
+        best, where, best_tag = np.inf, None, None
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    bucket = self.cells.get((key[0] + dx, key[1] + dy, key[2] + dz))
+                    if not bucket:
+                        continue
+                    for other, tag in bucket:
+                        if skip is not None and skip(tag):
+                            continue
+                        d = other - point
+                        d2 = float(d @ d)
+                        if d2 < best:
+                            best, where, best_tag = d2, other, tag
+        best = float(np.sqrt(best))
+        return (best, where, best_tag) if best <= radius else (np.inf, None, None)
+
     def near(self, point, radius, skip=None) -> bool:
         """Any stored point within ``radius`` (entries with tag ``skip(tag)`` true ignored)."""
         key = self._key(point)
@@ -3502,7 +3618,7 @@ def surface_stress_lines(streamlines, surface, surface_grid, iso, tensors, optio
             if not chunk:
                 break
             halves = _trace_halves(field, tensors, np.asarray(chunk), family, iso, step, low,
-                                   max_steps, floor)
+                                   max_steps, floor, options.get("ceiling"))
             for candidate in halves:
                 if n_accepted >= max_lines:
                     break
@@ -3529,7 +3645,8 @@ def surface_stress_lines(streamlines, surface, surface_grid, iso, tensors, optio
     return out
 
 
-def _trace_halves(field, tensors, seeds, family, iso, step, low, max_steps, floor=None) -> list:
+def _trace_halves(field, tensors, seeds, family, iso, step, low, max_steps, floor=None,
+                  ceiling=None) -> list:
     """Integrate both halves of a line from every seed (vectorized); per seed
     ``(points (n, 3), magnitudes (n,), seed index)`` or ``None``."""
     n = seeds.shape[0]
@@ -3565,6 +3682,8 @@ def _trace_halves(field, tensors, seeds, family, iso, step, low, max_steps, floo
         good &= np.all((new >= lo) & (new <= hi), axis=1)  # the clamped border is no surface
         if floor is not None:
             good &= new[:, 2] >= float(floor)
+        if ceiling is not None:
+            good &= new[:, 2] <= float(ceiling)
         alive[idx[~good]] = False
         go = idx[good]
         p[go] = new[good]
@@ -3716,9 +3835,14 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
         grid=grid, stress=np.asarray(stress), solid=_dilate6(surface >= iso)
     )
     floor = float(payload["floor"]) + 0.5 * grid.h if payload["mode"] == "SUPPORT" else None
-    if ribs_supported(streamlines):
-        # two empty layers around the grid: the surface closes inside it (a block that
-        # fills its grid has no iso crossing otherwise)
+    ceiling = None
+    if payload["mode"] == "SUPPORT" and payload.get("top") is not None:
+        # the contact pads carry the last stretch: no rib wanders right under the object
+        ceiling = float(payload["top"]) - max(1.5 * float(job["pad"]), 2.5) * grid.h
+    core_lines = ribs_supported(streamlines)
+    if core_lines:
+        # The core's surface mode on the smooth, finer surface (its own grid); the
+        # stress grid gets the same two empty layers so the surface lies inside it.
         padded = np.pad(surface, 2)
         padded_grid = Grid(padded.shape, grid.origin - 2.0 * grid.h, grid.h)
         field = streamlines.StressField(
@@ -3726,18 +3850,28 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
             stress=np.pad(np.asarray(stress), ((2, 2), (2, 2), (2, 2), (0, 0))),
             solid=_dilate6(padded >= iso),
         )
+        names = {f.name for f in dataclasses.fields(streamlines.SurfaceConstraint)}
+        constraint = {"field": fine, "iso": float(iso)}
+        if "grid" in names:
+            constraint["grid"] = fine_grid
+        else:  # an older surface mode: the field must live on the stress grid
+            constraint["field"] = padded
+        if "smoothing" in names:
+            constraint["smoothing"] = RIB_SMOOTHING
         trace_settings = streamlines.TraceSettings(
-            surface=streamlines.SurfaceConstraint(field=padded, iso=float(iso)), **options
+            surface=streamlines.SurfaceConstraint(**constraint), **options
         )
         lines = list(
             streamlines.trace(
                 field, trace_settings, progress=trace_progress, should_stop=should_stop
             )
         )
+        lines = clip_lines_z(lines, floor, ceiling)
     else:  # this core has no surface tracing: the add-on's own surface tracer
         candidates, _quads = mesher.surface_nets(fine, iso, fine_grid.origin, fine_grid.h)
         options = dict(options, separation=options["separation"] * ORGANIC_UPSAMPLE)
         options["floor"] = floor
+        options["ceiling"] = ceiling
         lines = surface_stress_lines(
             streamlines,
             fine,
@@ -3759,7 +3893,23 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
     anchors = np.vstack([loads, footings]) if footings.size else loads
     rib_radius = float(job["thickness"]) * h
     connect = max(2.2 * rib_radius + 0.5 * h, 1.25 * float(job["spacing"]) * h)
-    trimmed = trim_dangling(lines, anchors, connect, foot_radius + rib_radius, join=rib_radius)
+    # The core's evenly spaced lines cross everywhere: they form the lattice; only stubs
+    # past the last crossing and ribs crossing nothing go. The fallback's sparser lines
+    # are cleaned strictly (every rib between two junctions).
+    if not RIB_TRIM:
+        trimmed = lines
+    elif core_lines:
+        trimmed = trim_dangling(
+            lines,
+            anchors,
+            connect,
+            foot_radius + rib_radius,
+            rounds=2,
+            min_runs=1,
+            max_overhang=2.0 * float(job["spacing"]) * h,
+        )
+    else:
+        trimmed = trim_dangling(lines, anchors, connect, foot_radius + rib_radius, join=rib_radius)
     if not trimmed:
         warnings.append("Few ribs connect to each other: raise the Resolution or lower Spacing")
     lines = trimmed or lines
@@ -3782,14 +3932,22 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
     if not lines:
         raise ValueError("The stress lines do not form a connected lattice: lower Spacing")
     tubes = rib_tubes(
-        lines, h, job["thickness"], job["min_thickness"], sculpt, anchors, foot_radius + 2.0 * h
+        lines,
+        h,
+        job["thickness"],
+        job["min_thickness"],
+        sculpt,
+        anchors,
+        foot_radius + 2.0 * h,
+        connect,
     )
     for point in loads:  # contact pads: the lattice reaches every load and support
         tubes.append(sculpt.Tube(points=point[None, :], radius=pad_radius, value=0.0))
     for point in footings:
         tubes.append(sculpt.Tube(points=point[None, :], radius=foot_radius, value=0.0))
     thinnest = min(float(np.min(t.radius)) for t in tubes)
-    voxel = min(h / max(float(job["detail"]), 1e-3), max(thinnest / 1.25, 0.2 * h))
+    # at least two voxels across the thinnest rib radius: round, bead-free tubes
+    voxel = min(h / max(float(job["detail"]), 1e-3), max(thinnest / 2.0, 0.12 * h))
     pts = np.concatenate([np.asarray(t.points) for t in tubes])
     voxel = _cap_voxel(
         voxel,
@@ -3812,7 +3970,7 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
     values = np.asarray(values, dtype=np.float64)
     if float(job["skin"]) > 0.0:
         shell = skin_field(
-            {"field": surface, "origin": grid.origin, "h": h},
+            {"field": fine, "origin": fine_grid.origin, "h": fine_grid.h},
             iso,
             float(job["skin"]) * h,
             tube_field.shape,
@@ -4172,7 +4330,9 @@ def structure_request(context, settings, preview=False) -> dict:
             footings = explicit
             payload["floor"] = min(ground, float(explicit[:, 2].min()))
         else:
-            footings = modules["forms"].auto_footings(contacts, forces, ground, int(settings.footings))
+            footings = modules["forms"].auto_footings(
+                contacts, forces, ground, int(settings.footings)
+            )
         payload.update(contacts=contacts, forces=forces, footings=footings, explicit=explicit)
         height = max(float(contacts[:, 2].mean()) - ground, 1e-6)
         payload["height"] = height
@@ -4288,7 +4448,9 @@ def structure_request(context, settings, preview=False) -> dict:
         payload["object"] = _object_indicator(
             target, depsgraph, problem.grid.h / ORGANIC_UPSAMPLE
         )
-    need_optimizer = not (style == KIND_RIBS and mode == "CARVE" and settings.rib_source == "SURFACE")
+    need_optimizer = not (
+        style == KIND_RIBS and mode == "CARVE" and settings.rib_source == "SURFACE"
+    )
     if need_optimizer:
         payload["opt"] = _opt_settings_for(settings, topopt, fraction)
         payload["organic_signature"] = problem_digest(problem, payload["opt"])
@@ -4343,7 +4505,7 @@ def structure_request(context, settings, preview=False) -> dict:
 
 def structure_compute(payload, progress, should_stop, emit) -> dict:
     """Worker side of "Generate Structure" (pure numpy)."""
-    style, mode = payload["style"], payload["mode"]
+    style = payload["style"]
     out = {"payload": payload, "warnings": [], "state": None, "kind": style}
     if style == KIND_BRANCHING:
         out.update(branching_geometry(payload, progress, should_stop))
@@ -4810,7 +4972,9 @@ class STRESS_SCULPT_OT_verify(ThreadedOperatorMixin, Operator):
         )
         _report_warnings(self, payload["warnings"])
         if not result.info.get("converged", True):
-            self.report({"WARNING"}, "The solver did not fully converge: raise Max Solver Iterations")
+            self.report(
+                {"WARNING"}, "The solver did not fully converge: raise Max Solver Iterations"
+            )
         self.report(
             {"INFO"},
             f"Check: max von Mises {_format_stress(max_stress)}, max displacement "

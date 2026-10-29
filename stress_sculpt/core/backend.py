@@ -26,6 +26,7 @@ from contextlib import contextmanager
 import contextvars
 from dataclasses import dataclass, field, replace
 import importlib
+import math
 import os
 import threading
 import time
@@ -131,7 +132,7 @@ def _smoke_test(torch, device) -> None:
         y = torch.zeros(48, dtype=dtype, device=device)
         y.index_add_(0, idx, a.reshape(-1))
         s = float((b.sum() + y.sum()).item())
-        if not s == s:  # NaN
+        if not math.isfinite(s):
             raise RuntimeError("the GPU returned invalid numbers")
     if str(device).startswith("cuda"):
         torch.cuda.synchronize()
@@ -147,11 +148,11 @@ def _detect() -> TorchInfo:
         import torch  # noqa: F401  (optional dependency)
     except Exception as exc:  # ImportError, OSError (DLL / .so load), RuntimeError ...
         return done(importable=False, error=_import_error_message(exc))
-    base = dict(
-        importable=True,
-        version=str(getattr(torch, "__version__", "?")),
-        path=os.path.dirname(str(getattr(torch, "__file__", "") or "")),
-    )
+    base = {
+        "importable": True,
+        "version": str(getattr(torch, "__version__", "?")),
+        "path": os.path.dirname(str(getattr(torch, "__file__", "") or "")),
+    }
     try:
         base["cuda_build"] = str(getattr(getattr(torch, "version", None), "cuda", None) or "")
         available = bool(torch.cuda.is_available())

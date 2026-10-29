@@ -157,7 +157,8 @@ def _classic_specs(preset, bmin, bmax):
         specs.append(("SS_KeepSolid", "KEEP_SOLID", "CUBE",
                       (centre[0], 0.5 * (bmin[1] + void_y1), 0.5 * (plate_bottom + void_bottom)),
                       (0, 0, 0),
-                      (0.5 * size[0], 0.5 * (void_y1 - bmin[1]), 0.5 * (void_bottom - plate_bottom)),
+                      (0.5 * size[0], 0.5 * (void_y1 - bmin[1]),
+                       0.5 * (void_bottom - plate_bottom)),
                       {}))
         specs.append(("SS_Load", "LOAD", "SINGLE_ARROW",
                       (centre[0], bmin[1] + 0.4 * size[1], seat - 0.025 * size[2]), down,
@@ -193,7 +194,8 @@ def classic_setup(preset="BRIDGE", resolution=16, domain=None):
         corners = np.array([tuple(domain.matrix_world @ Vector(c)) for c in domain.bound_box])
         bmin, bmax = corners.min(axis=0), corners.max(axis=0)
     settings.domain = domain
-    for name, role, display, location, rotation, scale, values in _classic_specs(preset, bmin, bmax):
+    for spec in _classic_specs(preset, bmin, bmax):
+        name, role, display, location, rotation, scale, values = spec
         obj = empty(name, role, display, 1.0, location, rotation, scale, **values)
         if role == "SUPPORT":
             obj.color = build.SUPPORT_COLOR
