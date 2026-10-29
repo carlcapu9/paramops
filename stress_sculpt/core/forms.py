@@ -494,6 +494,8 @@ def grow_tree(
         r = np.full(samples, radii[e])
         if kind[a] == 0:  # footing flare over the first ~25% of the trunk
             r *= 1.0 + (float(st.footing_flare) - 1.0) * _smoothstep(1.0 - s / 0.25)
+        else:  # root taper: the hidden start cap stays deep inside the parent (no collar ring)
+            r *= 0.55 + 0.45 * _smoothstep(s / 0.2)
         if kind[b] == 1 and out_r[b] < radii[e]:
             # narrow towards the split, down to the thickest branch it feeds
             target = max(out_r[b] * 1.08, 0.75 * radii[e])
