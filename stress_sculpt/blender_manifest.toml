@@ -1,0 +1,23 @@
+schema_version = "1.0.0"
+
+id = "stress_sculpt"
+version = "1.0.0"
+name = "Stress Sculpt"
+tagline = "Turn supports and loads into sculptures that follow stress"
+maintainer = "ParamOps"
+type = "add-on"
+
+tags = ["Modeling", "Mesh", "Physics", "Sculpt"]
+
+blender_version_min = "4.2.0"
+
+license = ["SPDX:GPL-3.0-or-later"]
+copyright = ["2026 ParamOps"]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "*.zip",
+  "*.pyc",
+]
