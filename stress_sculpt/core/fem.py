@@ -42,20 +42,31 @@ to Jacobi (``info["fallback"]``) if the hierarchy cannot be built or ever fails.
 Speed (see :mod:`.backend` for the choice of device):
 
 * element loops are "structured": the elements are cut into slabs, each slab into
-  boxes of ~4k elements whose 24 element dofs are gathered with 8 strided copies of
-  whole sub-grids (vectors are stored component-major inside the solver), multiplied
-  by ``KE`` with small batched BLAS calls (single-threaded inside BLAS, so there is
-  no oversubscription) and scattered back with 8 strided additions; slabs of equal
-  parity touch disjoint nodes and run on a thread pool (numpy releases the GIL).
-  Very sparse domains use index chunks instead of boxes. The decomposition depends
-  on the geometry only: results are identical for any number of threads,
+  boxes of up to ~16k elements whose 24 element dofs are gathered with one strided
+  view of the sub-grid (vectors are stored component-major inside the solver),
+  multiplied by ``KE`` with small batched BLAS calls (single-threaded inside BLAS,
+  so there is no oversubscription) and scattered back with 8 strided additions;
+  slabs of equal parity touch disjoint nodes and run on a thread pool (numpy
+  releases the GIL). Very sparse domains use index chunks instead of boxes. The
+  decomposition depends on the geometry only: results are bit-for-bit identical for
+  any number of threads,
 * vector operations (dot products, updates) are threaded the same way and avoid
-  BLAS level-1 calls, whose internal threads are very slow on busy machines,
+  BLAS level-1 calls, whose internal threads are very slow on busy machines; the
+  coarsest level is factored with a blocked Cholesky made of small BLAS products
+  (LAPACK's threaded routines took seconds per call on a busy machine),
 * ``precision="mixed"`` (backend): the V-cycle runs in float32 inside the float64
   conjugate gradient, which then uses the flexible Polak-Ribiere update; the
   stopping test (true relative residual) is unchanged,
 * a PyTorch backend runs the same algorithm on a GPU (:mod:`.fem_torch`) and falls
   back to numpy if the device fails.
+
+Measured on one core (shared 4-core container, min of repeats): K u for 250k
+elements 90 ms with the former index/bincount loop, 30-47 ms structured float64,
+18-26 ms float32; a 250k-element SIMP solve to 1e-6 took 18.8 s before, 9.3 s now
+in float64 and 6.5 s mixed (the former code was 2-5x slower still with OpenBLAS's
+own threads on a busy machine). At 4 threads ~3.3 slab tasks run concurrently (no
+GIL / lock serialization); there the cores were shared with other jobs, so the
+wall-clock gain was at most 1.5x; on an idle machine memory bandwidth is the limit.
 
 Everything here keeps no global mutable state: independent :class:`FEModel`
 instances may be used from different threads (a single instance must not be shared
@@ -618,6 +629,7 @@ _SLAB_MIN_ELEMS = 8192  # ... unless slabs would get smaller than this (thread o
 _GEMM_COLS = 128  # columns per BLAS call: 24 * 24 * 128 keeps OpenBLAS single-threaded
 _MIN_BOX_FILL = 0.35  # structured kernel when active / computed elements >= this
 _VEC_CHUNK = 1 << 17  # elements per chunk of the threaded vector operations
+_PARALLEL_TRANSFER_NODES = 1 << 16  # restriction / prolongation threaded from this size
 # The kernels number the 8 local nodes lexicographically, (di, dj, dk) = (L>>2, L>>1&1,
 # L&1), so that one strided view gathers all of them; ``_LEX_DOFS`` maps those element
 # dofs to the HEX_NODE_OFFSETS order of ``KE`` (``KE_lex = KE[_LEX_DOFS][:, _LEX_DOFS]``).
@@ -1336,8 +1348,18 @@ def _prolong_soa(xc: np.ndarray, fine: _Level, coarse: _Level, workers: _Workers
                 a = _prolong_axis(a, axis, fine.nodes_shape[axis])
         out[c] = a
 
-    workers.run(component, (0, 1, 2))
+    _run_components(workers, component, fine.n_nodes)
     return out.reshape(-1)
+
+
+def _run_components(workers: _Workers, fn, n_nodes: int) -> None:
+    """The 3 components in parallel on big levels, serially on small ones (dispatching
+    to the pool costs more than the work there)."""
+    if n_nodes >= _PARALLEL_TRANSFER_NODES:
+        workers.run(fn, (0, 1, 2))
+    else:
+        for c in range(3):
+            fn(c)
 
 
 def _restrict_soa(rf: np.ndarray, fine: _Level, coarse: _Level, workers: _Workers) -> np.ndarray:
@@ -1352,7 +1374,7 @@ def _restrict_soa(rf: np.ndarray, fine: _Level, coarse: _Level, workers: _Worker
                 a = _restrict_axis(a, axis, coarse.nodes_shape[axis])
         out[c] = a
 
-    workers.run(component, (0, 1, 2))
+    _run_components(workers, component, fine.n_nodes)
     return out.reshape(-1)
 
 

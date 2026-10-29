@@ -85,6 +85,46 @@ def compute_settings(context=None) -> tuple:
     return str(prefs.compute_device), int(prefs.cpu_threads)
 
 
+def solver_compute(compute, context=None):
+    """Wrap a job's ``compute(payload, progress, should_stop, emit)`` for the solver device.
+
+    Call on the main thread (it reads the preferences); the returned function, run
+    in the worker thread, builds the backend there (the first GPU use imports PyTorch
+    and starts CUDA, a few seconds) and makes every FE model created inside
+    ``compute`` use it (``backend.using_backend``)::
+
+        job.run(preferences.solver_compute(self.compute, context), payload)
+    """
+    device, threads = compute_settings(context)
+
+    def run(payload, progress, should_stop, emit):
+        if device != "CPU" and backend.cached_torch_info() is None and progress is not None:
+            if torch_installed():
+                progress(0.0, "Starting the GPU (first use in this session)")
+        be = backend.get_backend(device, threads)
+        with backend.using_backend(be):
+            return compute(payload, progress, should_stop, emit)
+
+    run.__name__ = getattr(compute, "__name__", "compute")
+    run.__doc__ = getattr(compute, "__doc__", None)
+    return run
+
+
+_FIND_SPEC = {"time": -1e9, "found": False}
+
+
+def torch_installed() -> bool:
+    """``import torch`` would find a package (cheap check, cached for 5 s; no import)."""
+    now = time.monotonic()
+    if now - _FIND_SPEC["time"] > 5.0:
+        try:
+            _FIND_SPEC["found"] = importlib.util.find_spec("torch") is not None
+        except (ImportError, ValueError):
+            _FIND_SPEC["found"] = False
+        _FIND_SPEC["time"] = now
+    return _FIND_SPEC["found"]
+
+
 def status_line(context=None) -> str:
     """One line for the UI: which device the solver will use (never imports torch)."""
     device, threads = compute_settings(context)
@@ -94,7 +134,7 @@ def status_line(context=None) -> str:
         return f"Solver: {cpu}"
     info = backend.cached_torch_info()
     if info is None:
-        if importlib.util.find_spec("torch") is None:
+        if not torch_installed():
             return f"Solver: {cpu} - GPU support not installed"
         return f"Solver: {cpu} or GPU (checked at the first solve)"
     if info.gpu_ok:
@@ -112,6 +152,11 @@ def modules_dir(create: bool = False) -> str:
 
 def online_access_allowed() -> bool:
     return bool(getattr(bpy.app, "online_access", True))
+
+
+def cuda_platform() -> bool:
+    """CUDA builds of PyTorch exist for Windows and Linux on x86-64 / arm64 only."""
+    return sys.platform.startswith(("win", "linux"))
 
 
 OFFLINE_MESSAGE = (
@@ -478,6 +523,7 @@ def _activate_target(target: str) -> None:
     if os.path.isdir(target) and target not in sys.path:
         sys.path.append(target)
     importlib.invalidate_caches()
+    _FIND_SPEC["time"] = -1e9
 
 
 def _remove_distribution(target: str, dist_info: str, job: _Job) -> tuple:
@@ -567,6 +613,7 @@ def uninstall_torch(job: _Job, target: str) -> bool:
         return False
     _try_remove(manifest_path)
     importlib.invalidate_caches()
+    _FIND_SPEC["time"] = -1e9
     return True
 
 
@@ -686,7 +733,7 @@ def _maybe_auto_check() -> None:
     if _AUTO_CHECKED["done"] or JOB.running or backend.cached_torch_info() is not None:
         return
     _AUTO_CHECKED["done"] = True
-    if importlib.util.find_spec("torch") is not None:
+    if torch_installed():
         start_job("CHECK", None)
 
 
@@ -705,6 +752,9 @@ class STRESS_SCULPT_OT_install_gpu_support(Operator):
         return not JOB.running
 
     def execute(self, context):
+        if not cuda_platform():
+            self.report({"ERROR"}, "GPU support needs an NVIDIA GPU on Windows or Linux")
+            return {"CANCELLED"}
         if not online_access_allowed():
             self.report({"ERROR"}, OFFLINE_MESSAGE)
             return {"CANCELLED"}
@@ -831,7 +881,7 @@ class STRESS_SCULPT_AddonPreferences(AddonPreferences):
         if job["running"] and job["kind"] == "CHECK":
             status.label(text="Checking PyTorch and the GPU...", icon="TIME")
         elif info is None:
-            if importlib.util.find_spec("torch") is None:
+            if not torch_installed():
                 status.label(text="PyTorch is not installed: the solver uses the CPU", icon="DOT")
             else:
                 status.label(text="PyTorch found, GPU not checked yet", icon="DOT")
@@ -845,13 +895,15 @@ class STRESS_SCULPT_AddonPreferences(AddonPreferences):
         online = online_access_allowed()
         row = box.row(align=True)
         sub = row.row(align=True)
-        sub.enabled = online and not job["running"]
+        sub.enabled = online and not job["running"] and cuda_platform()
         sub.operator(STRESS_SCULPT_OT_install_gpu_support.bl_idname, icon="IMPORT")
         row.operator(
             STRESS_SCULPT_OT_uninstall_gpu_support.bl_idname, text="Uninstall", icon="TRASH"
         )
         row.operator(STRESS_SCULPT_OT_check_gpu.bl_idname, text="", icon="FILE_REFRESH")
-        if not online:
+        if not cuda_platform():
+            box.label(text="GPU support needs an NVIDIA GPU on Windows or Linux", icon="INFO")
+        elif not online:
             warn = box.column(align=True)
             warn.alert = True
             warn.label(text="Online access is disabled: nothing can be downloaded", icon="ERROR")

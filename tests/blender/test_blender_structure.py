@@ -610,3 +610,59 @@ def test_generate_keeps_the_last_state_when_cancelled(scene):
     assert snapshots and snapshots[-1]["state"].iteration == output["state"].iteration
     partial = operators._structure_partial(snapshots[0])
     assert partial["state"].iteration == 1 and partial["kind"] == "ORGANIC"
+
+
+def test_unprojected_density_inverts_the_projection():
+    if not _topopt_available():
+        pytest.skip("core/topopt.py not available yet")
+    from stress_sculpt.core import topopt
+
+    t = np.linspace(0.0, 1.0, 201)
+    for beta in (1.0, 8.0, 16.0, 64.0):
+        rho = topopt.project(t, beta, 0.5)
+        back = operators.unprojected_density(rho, beta, 0.5)
+        assert back.min() >= 0.0 and back.max() <= 1.0
+        assert back[0] == 0.0 and back[-1] == 1.0  # void / solid stay put
+        near = np.abs(t - 0.5) < min(0.45, 8.0 / beta)  # what the precision keeps
+        assert np.allclose(back[near], t[near], atol=1e-6)
+        assert np.all(np.diff(back) >= -1e-12)  # monotonic: the same solid elements
+    assert np.array_equal(operators.unprojected_density(t, 0.0), t)  # no projection
+
+
+def test_organic_field_meshes_the_smooth_density_at_the_same_volume():
+    require("sculpt", "mesher")
+    if not _topopt_available():
+        pytest.skip("core/topopt.py not available yet")
+    from types import SimpleNamespace
+
+    from stress_sculpt.core import mesher, sculpt, topopt
+    from stress_sculpt.core.grid import Grid
+
+    n, h = 20, 0.1
+    grid = Grid((n, n, n), np.zeros(3), h)
+    c = (np.arange(n) + 0.5) * h
+    x, y, z = np.meshgrid(c, c, c, indexing="ij")
+    # a slanted bar: voxel steps along its whole length once projected
+    d = np.hypot(x - 0.3 - 0.6 * z, y - 1.0)
+    smooth = np.clip(0.5 + (0.35 - d) / (2.0 * h), 0.0, 1.0)
+    state = SimpleNamespace(density=topopt.project(smooth, 16.0, 0.5), beta=16.0)
+    problem = SimpleNamespace(grid=grid, domain=np.ones((n, n, n), dtype=bool))
+    stepped, origin, fh = operators.organic_field(state, problem, "CARVE", 2, sculpt)
+    matched, origin2, fh2 = operators.organic_field(
+        state, problem, "CARVE", 2, sculpt, iso=0.5, eta=0.5
+    )
+    assert matched.shape == stepped.shape and fh2 == fh
+    assert np.allclose(origin2, origin)
+    inside = np.count_nonzero(matched > 0.5)
+    assert abs(inside - np.count_nonzero(stepped > 0.5)) <= 0.01 * inside  # same volume
+
+    def roughness(field):  # spread of the normals' change between neighbouring vertices
+        verts, faces = mesher.surface_nets(field, 0.5, origin, fh)
+        gx, gy, gz = np.gradient(field)
+        idx = np.clip(((verts - origin) / fh).astype(int), 0, np.array(field.shape) - 1)
+        g = np.stack([a[idx[:, 0], idx[:, 1], idx[:, 2]] for a in (gx, gy, gz)], axis=1)
+        g /= np.maximum(np.linalg.norm(g, axis=1, keepdims=True), 1e-12)
+        quads = np.asarray(faces)
+        return float(np.mean(1.0 - np.sum(g[quads[:, 0]] * g[quads[:, 2]], axis=1)))
+
+    assert roughness(matched) < roughness(stepped)

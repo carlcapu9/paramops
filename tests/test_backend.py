@@ -213,12 +213,13 @@ def test_threaded_kernels_match_reference(which, small_blocks, monkeypatch):
     u = rng.standard_normal(model.n_dofs)
     s = rng.uniform(0.01, 2.0, model.n_act)
     ref = fem._apply_elements(u, model.edof, model._edof_flat, model.KE, s, model.n_dofs)
-    np.testing.assert_allclose(model.apply_K(u, s), ref * model.free, rtol=0, atol=1e-13 * np.abs(ref).max())
+    close = np.testing.assert_allclose
+    close(model.apply_K(u, s), ref * model.free, rtol=0, atol=1e-13 * np.abs(ref).max())
     ue = u[model.edof]
     energy = np.einsum("ij,ij->i", ue @ model.KE, ue)
-    np.testing.assert_allclose(model.element_energy(u), energy, rtol=1e-12, atol=1e-14 * energy.max())
+    close(model.element_energy(u), energy, rtol=1e-12, atol=1e-14 * energy.max())
     stress = (ue @ model._stress_op.T) * s[:, None]
-    np.testing.assert_allclose(model.element_stress(u, s), stress, rtol=1e-12, atol=1e-13 * np.abs(stress).max())
+    close(model.element_stress(u, s), stress, rtol=1e-12, atol=1e-13 * np.abs(stress).max())
     # NaN on dofs that no active element touches is ignored (as before)
     u2 = u.copy()
     u2[~model._touched] = np.nan
@@ -239,7 +240,8 @@ def test_threads_give_bitwise_identical_results(which, small_blocks, monkeypatch
     results = {}
     for threads in (1, 4):
         out = []
-        for precision, solver, maxiter in (("float64", "MG", 8), ("mixed", "MG", 8), ("float64", "JACOBI", 25)):
+        runs = (("float64", "MG", 8), ("mixed", "MG", 8), ("float64", "JACOBI", 25))
+        for precision, solver, maxiter in runs:
             model = fem.FEModel(prob, solver, backend=cpu(threads, precision),
                                 mg_options=fem.MGOptions(coarse_dofs=60))
             scale = simp_scale(model, seed=5)
@@ -309,7 +311,7 @@ def test_torch_backend_failure_falls_back_to_numpy():
     """A device that cannot work (no CUDA here) -> numpy result, reason reported, sticky."""
     prob = cantilever((10, 4, 4))
     ref, _ = fem.FEModel(prob, backend=cpu(1)).solve(None, tol=1e-9)
-    model = fem.FEModel(prob, backend=backend.torch_backend("cuda:7"))
+    model = fem.FEModel(prob, backend=backend.torch_backend("cuda:99"))
     u, info = model.solve(None, tol=1e-9)
     assert info["converged"] and "backend_fallback" in info and "CPU" in info["backend"]
     np.testing.assert_allclose(u, ref, rtol=0, atol=1e-7 * np.abs(ref).max())
@@ -317,7 +319,7 @@ def test_torch_backend_failure_falls_back_to_numpy():
     u2, info2 = model.solve(None, tol=1e-9)
     assert "backend_fallback" in info2
     # AUTO keeps small models on the CPU without touching torch
-    small = fem.FEModel(prob, backend=backend.torch_backend("cuda:7", min_elements=10**6))
+    small = fem.FEModel(prob, backend=backend.torch_backend("cuda:99", min_elements=10**6))
     _, info3 = small.solve(None)
     assert "backend_fallback" not in info3 and small._torch_error is None
 
@@ -490,7 +492,9 @@ def make_fake_wheel(folder, name="torch", version="0.0.1"):
         f"{name}/__init__.py": f"__version__ = '{version}+fake'\n",
         f"{name}/sub/data.txt": "payload\n",
         f"{dist}/METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
-        f"{dist}/WHEEL": "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
+        f"{dist}/WHEEL": (
+            "Wheel-Version: 1.0\nGenerator: test\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
         f"{dist}/entry_points.txt": f"[console_scripts]\n{name}run = {name}:main\n",
     }
     records = [f"{k},," for k in files] + [f"{dist}/RECORD,,"]
@@ -515,18 +519,20 @@ def test_installer_and_uninstaller_with_local_wheel(tmp_path, monkeypatch):
     (other / "RECORD").write_text("otherpkg/__init__.py,,\n")
     job = prefs._Job()
     job.begin("INSTALL")
-    ok = prefs.install_torch(job, str(target), extra_args=["--no-index", "--find-links", str(wheels)])
+    offline = ["--no-index", "--find-links", str(wheels)]
+    ok = prefs.install_torch(job, str(target), extra_args=offline)
     assert ok, (job.error, list(job.lines)[-10:])
     assert (target / "torch" / "__init__.py").is_file()
     manifest = (target / prefs.MANIFEST_NAME).read_text()
     assert '"torch"' in manifest and "otherpkg" not in manifest.split('"added"')[1]
     assert any("Successfully installed" in line for line in job.lines)
     assert str(target) in sys.path
-    scripts = [p for d in ("bin", "Scripts") if (target / d).is_dir() for p in (target / d).iterdir()]
+    script_dirs = [target / d for d in ("bin", "Scripts") if (target / d).is_dir()]
+    scripts = [p for d in script_dirs for p in d.iterdir()]
     assert any(p.name.startswith("torchrun") for p in scripts)  # console script of the wheel
     # reinstall over it: still tracked as ours
     job.begin("INSTALL")
-    assert prefs.install_torch(job, str(target), extra_args=["--no-index", "--find-links", str(wheels)])
+    assert prefs.install_torch(job, str(target), extra_args=offline)
     assert '"torch"' in (target / prefs.MANIFEST_NAME).read_text().split('"added"')[1]
     job.begin("UNINSTALL")
     assert prefs.uninstall_torch(job, str(target))
@@ -601,5 +607,125 @@ def test_addon_preferences_when_enabled():
         "assert not P.STRESS_SCULPT_AddonPreferences.is_registered\n"
         "print('OK')\n"
     )
-    res = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=300)
+    cmd = [sys.executable, "-c", script]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
     assert res.returncode == 0 and "OK" in res.stdout, res.stdout[-2000:] + res.stderr[-2000:]
+
+
+class _MockLayout:
+    """Records UILayout calls (no real layout exists in background mode)."""
+
+    def __init__(self, log):
+        self.log = log
+        self.enabled = True
+        self.alert = False
+        self.use_property_split = False
+        self.use_property_decorate = True
+
+    def _child(self, *args, **kwargs):
+        return _MockLayout(self.log)
+
+    column = row = box = _child
+
+    def label(self, text="", icon="NONE"):
+        assert isinstance(text, str)
+        self.log.append(("label", text, icon))
+
+    def prop(self, data, name, **kwargs):
+        assert hasattr(data, name), name
+        self.log.append(("prop", name))
+
+    def operator(self, idname, **kwargs):
+        assert idname.startswith("stress_sculpt."), idname
+        self.log.append(("operator", idname))
+        return SimpleNamespace()
+
+
+def test_preferences_draw_in_every_state(monkeypatch, fresh_detection):
+    prefs = pytest.importorskip("stress_sculpt.preferences")
+    cls = prefs.STRESS_SCULPT_AddonPreferences
+    monkeypatch.setattr(prefs, "_maybe_auto_check", lambda: None)  # no background import
+    monkeypatch.setattr(prefs, "JOB", prefs._Job())
+
+    def draw(**state):
+        log = []
+        fake = SimpleNamespace(
+            layout=_MockLayout(log), compute_device="AUTO", cpu_threads=0, cuda_build="AUTO",
+            show_gpu_advanced=True, show_gpu_log=True,
+        )
+        fake.__dict__.update(state)
+        fake._draw_gpu = types.MethodType(cls._draw_gpu, fake)
+        cls.draw(fake, bpy_context())
+        return log
+
+    def labels(log):
+        return " | ".join(entry[1] for entry in log if entry[0] == "label")
+
+    # never checked
+    log = draw()
+    assert ("operator", "stress_sculpt.install_gpu_support") in log
+    assert "Solver:" in labels(log)
+    # torch missing
+    monkeypatch.setattr(backend, "_DETECTED", backend.TorchInfo(error="PyTorch is not installed"))
+    assert "PyTorch is not installed" in labels(draw())
+    # a working GPU
+    info = backend.TorchInfo(
+        importable=True, version="2.6.0+cu124", path="/x/torch", cuda_build="12.4",
+        cuda_available=True, device_name="NVIDIA GeForce RTX 4070", total_memory=12 << 30,
+    )
+    monkeypatch.setattr(backend, "_DETECTED", info)
+    text = labels(draw(compute_device="GPU"))
+    assert "RTX 4070" in text and "PyTorch 2.6.0+cu124" in text
+    # an install in progress, then failed
+    prefs.JOB.begin("INSTALL")
+    prefs.JOB.log("Collecting torch")
+    prefs.JOB.set_status("Downloading torch-2.6.0 (2.5 GB)")
+    log = draw()
+    assert ("operator", "stress_sculpt.cancel_gpu_job") in log and "Downloading" in labels(log)
+    prefs.JOB.end(False, "Installation failed", "network error: check the internet connection")
+    assert "network error" in labels(draw())
+    assert "stress_sculpt.cancel_gpu_job" not in str(draw())
+
+
+def bpy_context():
+    bpy = pytest.importorskip("bpy")
+    return bpy.context
+
+
+@needs_torch
+def test_topology_optimization_runs_on_the_torch_backend():
+    """End to end: the Optimizer's model picks the thread's backend (no topopt change)."""
+    topopt = pytest.importorskip("stress_sculpt.core.topopt")
+    prob = cantilever((14, 6, 6))
+    settings = topopt.OptSettings(volfrac=0.4, max_iter=4, solver_tol=1e-8)
+    histories = {}
+    for name, be in (("numpy", cpu(2, "float64")), ("torch", torch_cpu("mixed"))):
+        with backend.using_backend(be):
+            opt = topopt.Optimizer(prob, settings)
+        assert opt.model.backend is be
+        states = [opt.step() for _ in range(3)]
+        histories[name] = (np.array([s.compliance for s in states]), states[-1].density)
+        assert getattr(opt.model, "_torch_error", None) is None
+    c_np, d_np = histories["numpy"]
+    c_t, d_t = histories["torch"]
+    np.testing.assert_allclose(c_t, c_np, rtol=1e-5)
+    np.testing.assert_allclose(d_t, d_np, rtol=0, atol=1e-4)
+
+
+def test_solver_compute_wrapper_sets_the_backend(monkeypatch, fresh_detection):
+    prefs = pytest.importorskip("stress_sculpt.preferences")
+    monkeypatch.setattr(prefs, "compute_settings", lambda context=None: ("CPU", 3))
+    seen = {}
+
+    def compute(payload, progress, should_stop, emit):
+        seen["model"] = fem.FEModel(cantilever((4, 3, 3)))
+        return payload + 1
+
+    wrapped = prefs.solver_compute(compute)
+    result = {}
+    t = threading.Thread(target=lambda: result.update(r=wrapped(41, None, None, None)))
+    t.start()
+    t.join()
+    assert result["r"] == 42
+    assert seen["model"].backend.kind == "NUMPY" and seen["model"].threads == 3
+    assert backend.current_backend() is None  # nothing leaks into this thread

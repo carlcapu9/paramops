@@ -31,6 +31,7 @@ import os
 import threading
 import time
 from typing import Optional
+import warnings
 
 
 DEVICES = ("AUTO", "CPU", "GPU")
@@ -155,7 +156,9 @@ def _detect() -> TorchInfo:
     }
     try:
         base["cuda_build"] = str(getattr(getattr(torch, "version", None), "cuda", None) or "")
-        available = bool(torch.cuda.is_available())
+        with warnings.catch_warnings(record=True) as caught:  # e.g. "driver too old"
+            warnings.simplefilter("always")
+            available = bool(torch.cuda.is_available())
     except Exception as exc:
         return done(error=f"the CUDA check failed ({type(exc).__name__}: {exc})", **base)
     if not available:
@@ -163,6 +166,10 @@ def _detect() -> TorchInfo:
             reason = "this PyTorch build has no CUDA support (CPU-only build)"
         else:
             reason = "no usable NVIDIA GPU or driver was found"
+            notes = [str(w.message).strip() for w in caught]
+            notes = [n.splitlines()[0] for n in notes if n]
+            if notes:
+                reason += f" ({notes[0][:200]})"
         return done(error=reason, **base)
     try:
         base["device_count"] = int(torch.cuda.device_count())

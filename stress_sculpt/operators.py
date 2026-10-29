@@ -2389,6 +2389,9 @@ COMPONENT_KEEP = 0.03  # parts smaller than this share of the largest part are d
 ORGANIC_UPSAMPLE = 2  # the optimized density is meshed on a grid this much finer
 ORGANIC_BLUR = 2  # [1, 2, 1] passes over that finer grid (rounds the voxel facets)
 ORGANIC_OPENING = 0  # grey opening radius in fine voxels: removes webs thinner than that
+# Mesh the filtered density behind the projected one (same solid elements, smooth
+# sub-voxel surface instead of voxel steps), shifted to the projected mesh's volume.
+ORGANIC_UNPROJECT = True
 MEMBER_TAPER = 1.15  # a member ends at this times its thickest child's radius
 RIB_SMOOTHING = 2.0  # voxels: the ribs are smoothed over this length (surface mode)
 RIB_TRIM = True  # ribs run between junctions (dangling ends trimmed, loose ribs dropped)
@@ -2993,31 +2996,73 @@ def _box_filter(a, op, passes) -> np.ndarray:
     return out
 
 
-def organic_field(state, problem, mode, upsample=ORGANIC_UPSAMPLE, sculpt=None) -> tuple:
+def unprojected_density(density, beta, eta=0.5) -> np.ndarray:
+    """The filtered density behind a projected one (inverse of the core's projection).
+
+    The core maps the smooth filtered field ``t`` to the crisp physical density with
+    ``H(t) = (tanh(beta eta) + tanh(beta (t - eta))) / (tanh(beta eta) + tanh(beta (1 -
+    eta)))``. Inverting it gives back a field with the same solid elements whose
+    iso-surface runs smoothly between voxel centres instead of in voxel steps. Exact
+    0 / 1 stay put (saturated values carry no position); ``beta <= 0`` (no
+    projection) returns the density unchanged.
+    """
+    rho = np.asarray(density, dtype=np.float64)
+    beta, eta = float(beta), float(eta)
+    if not (beta > 0.0 and 0.0 < eta < 1.0):
+        return rho
+    tb = math.tanh(beta * eta)
+    denom = tb + math.tanh(beta * (1.0 - eta))
+    t = np.clip(rho * denom - tb, -1.0 + 1e-15, 1.0 - 1e-15)
+    smooth = np.clip(eta + np.arctanh(t) / beta, 0.0, 1.0)
+    return np.where(rho <= 0.0, 0.0, np.where(rho >= 1.0, 1.0, smooth))
+
+
+def organic_field(state, problem, mode, upsample=ORGANIC_UPSAMPLE, sculpt=None, iso=None,
+                  eta=0.5) -> tuple:
     """Optimized density on a finer grid, padded for flush cuts.
 
     SUPPORT: zeros around the design box except below the ground, where the
     bottom layer continues (cut flat later). CARVE: borders replicated (the block
-    clip trims them flush with the block faces). Returns ``(field, origin, h)``.
+    clip trims them flush with the block faces). With ``iso`` (and a projected
+    state, ``state.beta > 0``) the filtered density behind the projection is meshed
+    instead (``ORGANIC_UNPROJECT``), shifted so that as much of the finer grid lies
+    above ``iso`` as for the projected density. Returns ``(field, origin, h)``.
     """
     grid = problem.grid
     density = np.where(problem.domain, np.asarray(state.density, dtype=np.float64), 0.0)
-    if mode == "SUPPORT":
-        padded = np.pad(density, 1)
-        padded[1:-1, 1:-1, 0] = density[:, :, 0]
-    else:
-        padded = np.pad(density, 1, mode="edge")
     origin = grid.origin - grid.h
+
+    def padded(values):
+        if mode == "SUPPORT":
+            out = np.pad(values, 1)
+            out[1:-1, 1:-1, 0] = values[:, :, 0]
+            return out
+        return np.pad(values, 1, mode="edge")
+
     if upsample <= 1 or sculpt is None:
-        return padded, origin, grid.h
+        return padded(density), origin, grid.h
     fine_h = grid.h / float(upsample)
-    shape = tuple(int(n) * int(upsample) for n in padded.shape)
-    fine = sculpt.resample_to(padded, origin, grid.h, shape, origin, fine_h)
-    if ORGANIC_OPENING > 0:
-        fine = _box_filter(_box_filter(fine, np.minimum, ORGANIC_OPENING), np.maximum,
-                           ORGANIC_OPENING)
-    for _ in range(max(0, int(ORGANIC_BLUR))):
-        fine = _blur121(fine)
+    shape = tuple(int(n) * int(upsample) + 2 * int(upsample) for n in density.shape)
+
+    def finer(values):
+        fine = sculpt.resample_to(padded(values), origin, grid.h, shape, origin, fine_h)
+        if ORGANIC_OPENING > 0:
+            fine = _box_filter(_box_filter(fine, np.minimum, ORGANIC_OPENING), np.maximum,
+                               ORGANIC_OPENING)
+        for _ in range(max(0, int(ORGANIC_BLUR))):
+            fine = _blur121(fine)
+        return fine
+
+    fine = finer(density)
+    beta = float(getattr(state, "beta", 0.0) or 0.0)
+    if ORGANIC_UNPROJECT and iso is not None and beta > 0.0:
+        target = int(np.count_nonzero(fine > float(iso)))
+        if target > 0:
+            smooth = finer(np.where(problem.domain, unprojected_density(density, beta, eta), 0.0))
+            flat = smooth.ravel()
+            k = flat.size - min(target, flat.size)  # the target-th largest value ...
+            level = float(np.partition(flat, k)[k])
+            fine = smooth + (float(iso) - level)  # ... becomes the iso level
     return fine, origin, fine_h
 
 
@@ -3028,7 +3073,10 @@ def organic_geometry(state, problem, payload, smooth, progress=None, should_stop
     params = payload["params"]
     iso = float(params["iso"])
     mode = payload["mode"]
-    field, origin, h = organic_field(state, problem, mode, ORGANIC_UPSAMPLE, sculpt)
+    eta = float(getattr(payload.get("opt"), "eta", 0.5) or 0.5)
+    field, origin, h = organic_field(
+        state, problem, mode, ORGANIC_UPSAMPLE, sculpt, iso=iso, eta=eta
+    )
     check_stop(should_stop)
     clipped = support_clips(field, origin, h, iso, payload, sculpt)
     check_stop(should_stop)
@@ -3130,7 +3178,8 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=8, join=0.0, min
     Open ribs are trimmed to the span between their first and last junction and
     frame into the rib they meet; ribs with fewer than ``min_runs`` junctions are
     dropped. With ``max_overhang`` (a length) only overhangs shorter than that are
-    trimmed (stubs), longer free ends stay. Repeated until nothing changes
+    trimmed (stubs), longer free ends stay, and a rib that is only a short tick
+    across a single other rib is dropped. Repeated until nothing changes
     (removing a rib can strand others).
     """
     lines = [line for line in lines if len(line.points) >= 2]
@@ -3197,8 +3246,8 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=8, join=0.0, min
                     a = 0
                 if arc[-1] - arc[b] > max_overhang:
                     b = n - 1
-                if b <= a:
-                    kept.append(line)
+                if b <= a:  # a short tick across a single rib: it carries nothing
+                    changed = True
                     continue
             pts = points[a : b + 1]
             mag = np.asarray(line.magnitude)[a : b + 1]
