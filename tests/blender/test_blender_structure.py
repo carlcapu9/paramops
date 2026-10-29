@@ -38,8 +38,8 @@ def require_style(style, mode="SUPPORT", rib_source="EVOLVED"):
     if style == "ORGANIC" or (style == "RIBS" and not (mode == "CARVE" and rib_source == "SURFACE")):
         if not _topopt_available():
             pytest.skip("core/topopt.py not available yet")
-    if style == "RIBS" and not _ribs_available():
-        pytest.skip("core/streamlines.py has no surface tracing yet")
+    if style == "RIBS":
+        require("streamlines")  # surface tracing: the core's, or the add-on's own fallback
 
 
 def _structure(scene):
@@ -382,11 +382,6 @@ def test_generate_errors(scene):
     settings.structure_mode = "CARVE"
     with pytest.raises(RuntimeError, match="needs supports"):
         bpy.ops.stress_sculpt.generate()
-    if not _ribs_available():
-        settings.structure_mode = "SUPPORT"
-        settings.structure_style = "RIBS"
-        with pytest.raises(RuntimeError, match="Organic or Branching|topopt"):
-            bpy.ops.stress_sculpt.generate()
 
 
 def test_branching_support_contacts_and_footings(scene):

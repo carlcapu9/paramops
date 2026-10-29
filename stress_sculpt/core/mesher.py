@@ -48,6 +48,7 @@ __all__ = [
     "colormap",
     "srgb_to_linear",
     "remove_small_components",
+    "face_components",
     "COLORMAPS",
 ]
 
@@ -369,13 +370,16 @@ def _surface_nets(field, iso, origin, h, pad_value=None) -> tuple:
     info["residual_conflicts"] //= 2
 
     # ---- one vertex per patch: mean of its edge crossings
-    edge_patch = _PATCH[c_act, bits].astype(np.int64)  # (A, 12), -1 = edge not crossed
+    edge_patch = _PATCH[c_act, bits]  # (A, 12) int8, -1 = edge not crossed
     n_patch = _PATCH_COUNT[c_act, bits].astype(np.int64)
+    del c_act, bits
     info["split_cubes"] = int(np.count_nonzero(n_patch > 1))
     first = np.cumsum(n_patch) - n_patch
     n_verts = int(n_patch.sum())
-    ids, coords = [], [[], [], []]
-    for e in range(12):
+    del n_patch
+    counts = np.zeros(n_verts, dtype=np.float64)
+    verts = np.zeros((n_verts, 3), dtype=np.float64)
+    for e in range(12):  # accumulated edge by edge: temporaries stay ~A-sized
         sel = np.flatnonzero(edge_patch[:, e] >= 0)
         if sel.size == 0:
             continue
@@ -387,19 +391,17 @@ def _surface_nets(field, iso, origin, h, pad_value=None) -> tuple:
         s1[axis] = s1[axis] + 1
         v1 = _padded_values(flat_field, f.shape, pad, *s1)
         t = _crossing(v0, v1, iso)
+        del v0, v1, s1
+        ids = first[sel] + edge_patch[sel, e]
+        counts += np.bincount(ids, minlength=n_verts)
         for a in range(3):
             pos = origin[a] + (s[a] - 0.5) * h
             if a == axis:
                 pos = pos + t * h
-            coords[a].append(pos)
-        ids.append(first[sel] + edge_patch[sel, e])
-    ids = np.concatenate(ids)
-    counts = np.bincount(ids, minlength=n_verts).astype(np.float64)
-    verts = np.empty((n_verts, 3), dtype=np.float64)
-    for a in range(3):
-        verts[:, a] = np.bincount(ids, weights=np.concatenate(coords[a]), minlength=n_verts)
+            verts[:, a] += np.bincount(ids, weights=pos, minlength=n_verts)
+    del ci, cj, ck
     verts /= counts[:, None]
-    del ids, coords, counts
+    del counts
 
     # ---- one quad per crossed grid edge, oriented inside -> outside
     quads = []
@@ -429,7 +431,7 @@ def _surface_nets(field, iso, origin, h, pad_value=None) -> tuple:
                 + np.clip(cube[2], 0, cshape[2] - 1) * strides[2]
             )
             idx = np.minimum(np.searchsorted(act, flat), act.size - 1)
-            corners.append(first[idx] + edge_patch[idx, 4 * axis + ob + 2 * oc])
+            corners.append(first[idx] + edge_patch[idx, 4 * axis + ob + 2 * oc].astype(np.int64))
         quad = np.stack(corners, axis=1)
         quad[~lower_inside] = quad[~lower_inside][:, ::-1]
         quads.append(quad[valid])
@@ -615,9 +617,13 @@ def _component_labels(n: int, edges: np.ndarray) -> np.ndarray:
     """Connected-component root (smallest vertex id) of every vertex.
 
     Vectorized union-find: hook every root onto the smallest root it is linked to,
-    then pointer jumping, until no edge joins two different roots.
+    then pointer jumping, until no edge joins two different roots. Every round
+    hooks at least the largest root of each component that is not yet merged, so
+    the loop terminates; on meshes a handful of rounds suffice (a chain of roots
+    shrinks at least by half per round).
     """
     parent = np.arange(n, dtype=np.int64)
+    edges = np.asarray(edges, dtype=np.int64).reshape(-1, 2)
     if edges.size == 0:
         return parent
     u = edges[:, 0]
@@ -636,29 +642,55 @@ def _component_labels(n: int, edges: np.ndarray) -> np.ndarray:
             parent = jumped
 
 
-def remove_small_components(verts, faces, min_faces) -> tuple:
-    """Drop floating islands: connected components (by shared vertices) with fewer
-    than ``min_faces`` faces. The largest component is always kept.
+def _face_links(faces: np.ndarray) -> np.ndarray:
+    """Edges ``(F * (k - 1), 2)`` joining the first corner of every face to the others."""
+    links = [np.stack([faces[:, 0], faces[:, c]], axis=1) for c in range(1, faces.shape[1])]
+    return np.concatenate(links) if links else np.zeros((0, 2), dtype=np.int64)
 
-    Returns ``(verts, faces)`` with unused vertices removed and indices compacted.
+
+def face_components(n_verts, faces) -> np.ndarray:
+    """Connected-component label of every face ``(F,)`` int64: the lowest vertex index
+    of its component (faces are connected when they share a vertex)."""
+    faces = _as_faces(faces)
+    n_verts = int(n_verts)
+    if faces.shape[0] == 0:
+        return np.zeros(0, dtype=np.int64)
+    if int(faces.min()) < 0 or int(faces.max()) >= n_verts:
+        raise ValueError("face_components: face indices out of range")
+    return _component_labels(n_verts, _face_links(faces))[faces[:, 0]]
+
+
+def remove_small_components(verts, faces, min_faces, min_fraction=0.0, return_index=False) -> tuple:
+    """Drop floating islands: connected components (faces sharing a vertex) with fewer
+    than ``max(min_faces, min_fraction * largest)`` faces, ``largest`` being the face
+    count of the biggest component, which is always kept (on ties the one holding
+    the lowest vertex index).
+
+    Returns ``(verts, faces)`` with unused vertices removed and indices compacted
+    (``float64``, ``int64``); with ``return_index`` also the indices ``(V',)`` of the
+    kept vertices in the input (increasing), to carry per-vertex data along.
+    Raises ``ValueError`` if a face index is outside ``[0, len(verts))``.
     """
     verts = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
     faces = _as_faces(faces)
-    if faces.shape[0] == 0:
-        return verts[:0].copy(), faces.copy()
     n_verts = verts.shape[0]
-    links = [np.stack([faces[:, 0], faces[:, c]], axis=1) for c in range(1, faces.shape[1])]
-    labels = _component_labels(n_verts, np.concatenate(links))
-    face_label = labels[faces[:, 0]]
+    if faces.size and (int(faces.min()) < 0 or int(faces.max()) >= n_verts):
+        raise ValueError("remove_small_components: face indices out of range")
+    if faces.shape[0] == 0 or faces.shape[1] == 0:
+        empty = (verts[:0].copy(), np.zeros((0, faces.shape[1]), dtype=np.int64))
+        return empty + (np.zeros(0, dtype=np.int64),) if return_index else empty
+    face_label = _component_labels(n_verts, _face_links(faces))[faces[:, 0]]
     sizes = np.bincount(face_label, minlength=n_verts)
-    keep_label = sizes >= int(min_faces)
-    keep_label[int(np.argmax(sizes))] = True
-    keep = keep_label[face_label]
-    faces = faces[keep]
+    largest = int(np.argmax(sizes))  # labels are the lowest vertex index of a component
+    threshold = max(float(min_faces), float(min_fraction) * float(sizes[largest]))
+    keep_label = sizes >= threshold
+    keep_label[largest] = True
+    faces = faces[keep_label[face_label]]
     used = np.zeros(n_verts, dtype=bool)
     used[faces.ravel()] = True
     remap = np.cumsum(used) - 1
-    return verts[used], remap[faces]
+    out = (verts[used], remap[faces].astype(np.int64, copy=False))
+    return out + (np.flatnonzero(used),) if return_index else out
 
 
 # ============================================================================ field sampling

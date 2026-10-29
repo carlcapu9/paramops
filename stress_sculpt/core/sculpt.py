@@ -25,7 +25,7 @@ Field of one tube
     beads at the joints of a tapering polyline (an unrestricted capsule union would
     let the joint spheres poke out of the narrowing segment by up to ~7 % of the
     radius); bends get round outer corners. (The restriction can leave steps of
-    well under 1 % of the radius on the inside of sharp bends of strongly tapering
+    up to about 1 % of the radius on the inside of bends of strongly tapering
     tubes.) ``TUBE_ISO = 0.5`` puts the surface next to the inflection point of
     ``phi`` (``u^2 = 1/5``), where the field is almost linear across the surface, so
     the linear edge interpolation of the mesher is very accurate.
@@ -70,11 +70,11 @@ Smooth union (``blend`` in [0, 1])
     :func:`union_fields` combines two whole fields with the same rule (crease
     angle from their central-difference gradients).
 
-Memory is bounded: the grid is processed in slabs of at most ``_SLAB_CELLS``
-cells along x (the per-point accumulators live only for one slab) and the kernel
-evaluations in batches of at most ``_BATCH`` points (~100 MB of temporaries);
-besides the two output arrays nothing scales with the grid. Pure numpy, no
-global mutable state.
+Memory is bounded: the grid is processed in slabs of whole x-layers with at most
+``_SLAB_CELLS`` cells (the per-point accumulators exist for one slab only) and the
+kernel evaluations in batches of at most ``_BATCH`` points, about 150 MB of
+temporaries at most; besides the two output arrays nothing scales with the grid.
+Pure numpy, no global mutable state.
 """
 
 from dataclasses import dataclass
@@ -107,6 +107,7 @@ _TAU_ANGLE = 0.1  # fixed temperature of the weights that average the crease ang
 _PAIR_TOL = 1e-9  # pair weight (relative) below which one tube dominates alone
 _MIS_DEAD = 1e-10  # misalignment 1 - cos(theta) treated as parallel (rounding noise)
 _BATCH = 1 << 18  # grid-point evaluations per batch (bounds the temporaries)
+_MAX_SEGMENT_VOXELS = 32.0  # longer segments are cut into collinear pieces
 _COLUMN_BATCH = 1 << 18  # grid columns per batch of segments
 _SLAB_CELLS = 1 << 20  # cells per slab of accumulators (8 float64 arrays: 64 MB)
 _RESAMPLE_BLOCK = 1 << 22  # output elements per block in resample_to
@@ -188,11 +189,14 @@ def _as_tube(tube) -> Tube:
     return Tube(points=tube.points, radius=tube.radius, value=getattr(tube, "value", None))
 
 
-def _polyline_segments(p, r, v) -> Optional[tuple]:
+def _polyline_segments(p, r, v, max_length=np.inf) -> Optional[tuple]:
     """Segments of one tube: ``(a, u, length, ra, rb, va, vb, ext0, ext1)``.
 
     Invalid points (non-finite, radius <= 0) split the polyline; repeated points are
-    merged; a valid point without a valid neighbour becomes a ball.
+    merged; a valid point without a valid neighbour becomes a ball. Segments longer
+    than ``max_length`` are cut into equal collinear pieces (same field: collinear
+    joints get no slab extension and radius / value stay linear), which bounds the
+    number of grid columns a single segment needs.
     """
     valid = np.isfinite(p).all(axis=1) & np.isfinite(r) & (r > 0.0)
     if not valid.any():
@@ -205,8 +209,21 @@ def _polyline_segments(p, r, v) -> Optional[tuple]:
         dup[1:] = valid[1:] & valid[:-1] & (np.linalg.norm(p[1:] - p[:-1], axis=1) <= tol)
     keep = np.flatnonzero(valid & ~dup)
     q, rq, vq, pc = p[keep], r[keep], v[keep], piece[keep]
+    if q.shape[0] > 1 and np.isfinite(max_length) and max_length > 0.0:
+        seg_len = np.linalg.norm(q[1:] - q[:-1], axis=1)
+        pieces = np.where(pc[1:] == pc[:-1], np.ceil(seg_len / max_length), 1.0)
+        reps = np.append(np.maximum(pieces, 1.0).astype(np.int64), 1)
+        if np.any(reps > 1):
+            src = np.repeat(np.arange(q.shape[0]), reps)
+            frac = np.arange(src.size) - np.repeat(np.cumsum(reps) - reps, reps)
+            frac = frac / reps[src]
+            nxt = np.minimum(src + 1, q.shape[0] - 1)
+            q = q[src] + frac[:, None] * (q[nxt] - q[src])
+            rq = rq[src] + frac * (rq[nxt] - rq[src])
+            vq = vq[src] + frac * (vq[nxt] - vq[src])
+            pc = pc[src]
     support = rq * TUBE_SUPPORT
-    m = keep.size
+    m = q.shape[0]
     link = pc[1:] == pc[:-1]  # q[j] -> q[j + 1] is a segment
     step = q[1:] - q[:-1]
     length = np.linalg.norm(step, axis=1)
@@ -246,12 +263,13 @@ def _polyline_segments(p, r, v) -> Optional[tuple]:
     )
 
 
-def _segments(tubes) -> Optional[_Segments]:
-    """Segments of all tubes in tube order; ``None`` if there are none."""
+def _segments(tubes, max_length=np.inf) -> Optional[_Segments]:
+    """Segments of all tubes in tube order (none longer than ``max_length``);
+    ``None`` if there are none."""
     parts, owners = [], []
     for index, tube in enumerate(tubes):
         tube = _as_tube(tube)
-        part = _polyline_segments(tube.points, tube.radius, tube.value)
+        part = _polyline_segments(tube.points, tube.radius, tube.value, max_length)
         if part is not None and part[0].shape[0]:
             parts.append(part)
             owners.append(np.full(part[0].shape[0], index, dtype=np.int64))
@@ -775,7 +793,15 @@ def _check_grid(shape, h) -> tuple:
 
 
 # ============================================================================ public API
-def evaluate_tubes(tubes, shape, origin, h, blend=0.5, progress=None, should_stop=None) -> tuple:
+def evaluate_tubes(
+    tubes,
+    shape,
+    origin,
+    h,
+    blend=0.5,
+    progress: Optional[ProgressFn] = None,
+    should_stop: Optional[StopFn] = None,
+) -> tuple:
     """Tube field on a given element-centred grid ``(shape, origin, h)``.
 
     Same field as :func:`tubes_field` (see the module docstring), but on the caller's
@@ -786,11 +812,19 @@ def evaluate_tubes(tubes, shape, origin, h, blend=0.5, progress=None, should_sto
     origin = np.asarray(origin, dtype=np.float64).reshape(3)
     tubes = [_as_tube(t) for t in tubes]
     return _field_on_grid(
-        _segments(tubes), shape, origin, float(h), blend_tau(blend), progress, should_stop
+        _segments(tubes, _MAX_SEGMENT_VOXELS * float(h)), shape, origin, float(h), blend_tau(blend),
+        progress, should_stop,
     )
 
 
-def tubes_field(tubes, voxel_size, blend=0.5, pad=2, progress=None, should_stop=None) -> tuple:
+def tubes_field(
+    tubes,
+    voxel_size,
+    blend=0.5,
+    pad=2,
+    progress: Optional[ProgressFn] = None,
+    should_stop: Optional[StopFn] = None,
+) -> tuple:
     """Implicit field of the smooth union of ``tubes`` (mesh it at :data:`TUBE_ISO`).
 
     The grid (spacing ``voxel_size``, element-centred) covers the tubes' supports
@@ -807,7 +841,7 @@ def tubes_field(tubes, voxel_size, blend=0.5, pad=2, progress=None, should_stop=
     if not h > 0.0:
         raise ValueError("voxel_size must be positive")
     pad = max(0, int(pad))
-    seg = _segments([_as_tube(t) for t in tubes])
+    seg = _segments([_as_tube(t) for t in tubes], _MAX_SEGMENT_VOXELS * h)
     if seg is None:
         return np.zeros((1, 1, 1)), np.zeros(3), h, np.zeros((1, 1, 1))
     end = seg.a + seg.length[:, None] * seg.u

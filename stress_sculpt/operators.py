@@ -1397,6 +1397,9 @@ def demo_layout(preset) -> dict:
                 "symmetry_x": False,
                 "symmetry_y": False,
                 "symmetry_z": False,
+                "rib_spacing": 1.5,
+                "rib_thickness": 0.45,
+                "rib_min_thickness": 0.8,
             },
         }
     if preset == "BRIDGE":
@@ -1448,6 +1451,9 @@ def demo_layout(preset) -> dict:
                 "symmetry_x": True,
                 "symmetry_y": True,
                 "symmetry_z": False,
+                "rib_spacing": 1.5,
+                "rib_thickness": 0.45,
+                "rib_min_thickness": 0.8,
             },
         }
     raise ValueError(f"Unknown demo preset '{preset}'")
@@ -3059,7 +3065,7 @@ def ribs_supported(streamlines) -> bool:
     return "surface" in names and hasattr(streamlines, "SurfaceConstraint")
 
 
-def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3) -> list:
+def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3, join=0.0) -> list:
     """Clean rib lattice: every rib runs between two connections.
 
     A rib point is *connected* where another rib passes within ``connect`` or a
@@ -3115,13 +3121,19 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3) -> list:
                 b = points.shape[0] - 1
             pts = points[a : b + 1]
             mag = np.asarray(line.magnitude)[a : b + 1]
-            # frame into the rib it meets: the end reaches that rib's axis
-            if partner[a] is not None and float(np.linalg.norm(partner[a] - pts[0])) > 1e-9:
+            # frame into the rib it meets: the end reaches that rib's axis, the jog is
+            # smoothed into a curve
+            joined = False
+            if partner[a] is not None and float(np.linalg.norm(partner[a] - pts[0])) > join:
                 pts = np.vstack([partner[a][None, :], pts])
                 mag = np.concatenate([mag[:1], mag])
-            if partner[b] is not None and float(np.linalg.norm(partner[b] - pts[-1])) > 1e-9:
+                joined = True
+            if partner[b] is not None and float(np.linalg.norm(partner[b] - pts[-1])) > join:
                 pts = np.vstack([pts, partner[b][None, :]])
                 mag = np.concatenate([mag, mag[-1:]])
+                joined = True
+            if joined:
+                pts = _smooth_polyline(pts, False, passes=6)
             if pts.shape[0] != points.shape[0] or a > 0:
                 changed = True
             line = dataclasses.replace(
@@ -3135,68 +3147,73 @@ def trim_dangling(lines, anchors, connect, anchor_reach, rounds=3) -> list:
 
 
 def connector_ribs(streamlines, lines, loads, footings, field, tensors, iso, step, connect,
-                   reach, min_stress, floor=None, max_steps=1600) -> list:
+                   reach, min_stress, floor=None, max_steps=800) -> list:
     """Ribs from every weight the lattice does not reach, down its stress flow.
 
     For each load pad without a rib within ``reach``, both families are traced
-    from the pad (separation ignored) and the half that first meets the lattice
-    (a rib within ``connect``) or a footing wins: it runs from the pad to that
-    meeting point and frames into it. Weights whose flow meets nothing stay
-    unreached (reported by the operator).
+    from the pad (separation ignored; all pads at once, vectorized) and the half
+    that first meets the lattice (a rib within ``connect``) or a footing wins: it
+    runs from the pad to that meeting point and frames into it. Weights whose
+    flow meets nothing stay unreached (reported by the operator).
     """
     loads = np.asarray(loads, dtype=np.float64).reshape(-1, 3)
     footings = np.asarray(footings, dtype=np.float64).reshape(-1, 3)
     index = _PointHash(connect)
     for line in lines:
         index.add(np.asarray(line.points), [0] * len(line.points))
-    added = []
-    for pad in loads:
-        if index.near(pad, reach):
-            continue
-        start, ok, normal = field.project(pad[None, :], iso, max_move=8.0)
-        if not ok[0]:
-            continue
-        best = None
-        for family in ("COMPRESSION", "TENSION"):
-            _d, value, _g = tangent_principal(tensors.sample_tensor(start), normal, family)
-            low = min_stress * max(abs(float(value[0])), 1e-30)
-            halves = _trace_halves(
-                field, tensors, start, family, iso, step, low, max_steps, floor
-            )[0]
-            if halves is None:
+    missing = [pad for pad in loads if not index.near(pad, reach)]
+    if not missing:
+        return []
+    start, ok, normal = field.project(np.asarray(missing), iso, max_move=8.0)
+    start, normal = start[ok], normal[ok]
+    if start.shape[0] == 0:
+        return []
+    best = [None] * start.shape[0]
+    for family in ("COMPRESSION", "TENSION"):
+        _d, value, _g = tangent_principal(tensors.sample_tensor(start), normal, family)
+        low = min_stress * max(float(np.max(np.abs(value))), 1e-30)
+        halves = _trace_halves(field, tensors, start, family, iso, step, low, max_steps, floor)
+        for i, half in enumerate(halves):
+            if half is None:
                 continue
-            points, mags, centre = halves
+            points, mags, centre = half
             for direction in (1, -1):
-                idx = range(centre, points.shape[0]) if direction == 1 else range(centre, -1, -1)
+                idx = np.arange(centre, points.shape[0]) if direction == 1 else np.arange(
+                    centre, -1, -1)
                 for count, k in enumerate(idx):
-                    point = points[k]
                     if count * step < reach:
                         continue
-                    distance, partner = index.nearest(point, connect)
+                    point = points[k]
+                    _distance, partner = index.nearest(point, connect)
                     near_foot = footings.size and float(
                         np.min(np.linalg.norm(footings - point, axis=1))) <= reach
-                    if partner is not None or near_foot:
-                        span = list(idx)[: count + 1]
-                        pts = points[span]
-                        mag = np.asarray(mags)[span]
-                        if partner is not None:
-                            pts = np.vstack([pts, partner[None, :]])
-                            mag = np.append(mag, mag[-1])
-                        length = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
-                        if best is None or length < best[0]:
-                            best = (length, pts, mag, family)
-                        break
-        if best is None:
+                    if partner is None and not near_foot:
+                        continue
+                    span = idx[: count + 1]
+                    pts = points[span]
+                    mag = np.asarray(mags)[span]
+                    if partner is not None:
+                        pts = np.vstack([pts, partner[None, :]])
+                        mag = np.append(mag, mag[-1])
+                    length = float(np.linalg.norm(np.diff(pts, axis=0), axis=1).sum())
+                    if best[i] is None or length < best[i][0]:
+                        best[i] = (length, pts, mag, family)
+                    break
+    added = []
+    for entry in best:
+        if entry is None:
             continue
-        _length, pts, mag, family = best
-        line = streamlines.Polyline(
-            points=pts,
-            magnitude=mag,
-            family=family,
-            generation=0,
-            sign=np.full(pts.shape[0], 1.0 if family == "TENSION" else -1.0),
+        _length, pts, mag, family = entry
+        pts = _smooth_polyline(pts, False, passes=6)
+        added.append(
+            streamlines.Polyline(
+                points=pts,
+                magnitude=mag,
+                family=family,
+                generation=0,
+                sign=np.full(pts.shape[0], 1.0 if family == "TENSION" else -1.0),
+            )
         )
-        added.append(line)
         index.add(pts, [0] * pts.shape[0])
     return added
 
@@ -3268,36 +3285,42 @@ class SurfaceField:
         self.field = np.asarray(field, dtype=np.float64)
         self.origin = np.asarray(origin, dtype=np.float64)
         self.h = float(h)
+        nx, ny, nz = self.field.shape
+        # one replicated layer on the upper side: the 8 corners of a sample always exist
+        self._table = np.pad(self.field, ((0, 1), (0, 1), (0, 1)), mode="edge").ravel()
+        sy = nz + 1
+        sx = (ny + 1) * sy
+        self._strides = np.array([sx, sy, 1], dtype=np.int64)
+        self._offsets = np.array(
+            [a * sx + b * sy + c for a in (0, 1) for b in (0, 1) for c in (0, 1)],
+            dtype=np.int64,
+        )
         self._top = np.asarray(self.field.shape, dtype=np.float64) - 1.0
-        self._last = np.maximum(np.asarray(self.field.shape, dtype=np.int64) - 2, 0)
 
     def sample(self, points) -> tuple:
         """``(value (P,), gradient (P, 3))`` at world points (clamped to the grid)."""
         u = (np.asarray(points, dtype=np.float64).reshape(-1, 3) - self.origin) / self.h - 0.5
         u = np.clip(u, 0.0, self._top)
-        i0 = np.minimum(np.floor(u).astype(np.int64), self._last)
+        i0 = np.floor(u)
         t = u - i0
-        f = self.field
-        i, j, k = i0[:, 0], i0[:, 1], i0[:, 2]
-        c = {}
-        for a in (0, 1):
-            for b in (0, 1):
-                for d in (0, 1):
-                    c[a, b, d] = f[np.minimum(i + a, f.shape[0] - 1),
-                                   np.minimum(j + b, f.shape[1] - 1),
-                                   np.minimum(k + d, f.shape[2] - 1)]
+        c = self._table[(i0.astype(np.int64) @ self._strides)[:, None] + self._offsets]
         tx, ty, tz = t[:, 0], t[:, 1], t[:, 2]
         sx, sy, sz = 1.0 - tx, 1.0 - ty, 1.0 - tz
-        value = (
-            sx * (sy * (sz * c[0, 0, 0] + tz * c[0, 0, 1]) + ty * (sz * c[0, 1, 0] + tz * c[0, 1, 1]))
-            + tx * (sy * (sz * c[1, 0, 0] + tz * c[1, 0, 1]) + ty * (sz * c[1, 1, 0] + tz * c[1, 1, 1]))
-        )
-        gx = sy * (sz * (c[1, 0, 0] - c[0, 0, 0]) + tz * (c[1, 0, 1] - c[0, 0, 1])) + ty * (
-            sz * (c[1, 1, 0] - c[0, 1, 0]) + tz * (c[1, 1, 1] - c[0, 1, 1]))
-        gy = sx * (sz * (c[0, 1, 0] - c[0, 0, 0]) + tz * (c[0, 1, 1] - c[0, 0, 1])) + tx * (
-            sz * (c[1, 1, 0] - c[1, 0, 0]) + tz * (c[1, 1, 1] - c[1, 0, 1]))
-        gz = sx * (sy * (c[0, 0, 1] - c[0, 0, 0]) + ty * (c[0, 1, 1] - c[0, 1, 0])) + tx * (
-            sy * (c[1, 0, 1] - c[1, 0, 0]) + ty * (c[1, 1, 1] - c[1, 1, 0]))
+        # c[:, 4a + 2b + d] is the corner (i + a, j + b, k + d)
+        z00 = sz * c[:, 0] + tz * c[:, 1]
+        z01 = sz * c[:, 2] + tz * c[:, 3]
+        z10 = sz * c[:, 4] + tz * c[:, 5]
+        z11 = sz * c[:, 6] + tz * c[:, 7]
+        y0 = sy * z00 + ty * z01
+        y1 = sy * z10 + ty * z11
+        value = sx * y0 + tx * y1
+        gx = y1 - y0
+        gy = sx * (z01 - z00) + tx * (z11 - z10)
+        dz00 = c[:, 1] - c[:, 0]
+        dz01 = c[:, 3] - c[:, 2]
+        dz10 = c[:, 5] - c[:, 4]
+        dz11 = c[:, 7] - c[:, 6]
+        gz = sx * (sy * dz00 + ty * dz01) + tx * (sy * dz10 + ty * dz11)
         return value, np.stack([gx, gy, gz], axis=1) / self.h
 
     def project(self, points, iso, iterations=3, max_move=2.0) -> tuple:
@@ -3308,7 +3331,7 @@ class SurfaceField:
         """
         start = np.asarray(points, dtype=np.float64).reshape(-1, 3)
         p = start.copy()
-        iterations = max(int(iterations), int(np.ceil(max_move / 0.75)) + 1)
+        iterations = max(int(iterations), int(np.ceil(max_move / 0.75)))
         for _ in range(iterations):
             value, grad = self.sample(p)
             g2 = np.einsum("ij,ij->i", grad, grad)
@@ -3531,10 +3554,10 @@ def _trace_halves(field, tensors, seeds, family, iso, step, low, max_steps, floo
         n1 = grad / np.maximum(np.linalg.norm(grad, axis=1), 1e-30)[:, None]
         d1, _v1, _g1 = tangent_principal(tensors.sample_tensor(q), n1, family)
         d1 *= np.where(np.einsum("ij,ij->i", d1, prev) < 0.0, -1.0, 1.0)[:, None]
-        mid, okm, nm = field.project(q + 0.5 * step * d1, iso)
+        mid, okm, nm = field.project(q + 0.5 * step * d1, iso, iterations=2, max_move=1.0)
         d2, _v2, g2 = tangent_principal(tensors.sample_tensor(mid), nm, family)
         d2 *= np.where(np.einsum("ij,ij->i", d2, d1) < 0.0, -1.0, 1.0)[:, None]
-        new, okn, nn = field.project(q + step * d2, iso)
+        new, okn, nn = field.project(q + step * d2, iso, iterations=2, max_move=1.0)
         _d3, v3, g3 = tangent_principal(tensors.sample_tensor(new), nn, family)
         turn = np.einsum("ij,ij->i", d2, prev)
         good = okm & okn & (np.abs(v3) >= low) & (turn > 0.5) & (g2 > 1e-2) & (g3 > 1e-2)
@@ -3736,7 +3759,10 @@ def ribs_geometry(payload, surface, stress, grid, iso, progress, should_stop) ->
     anchors = np.vstack([loads, footings]) if footings.size else loads
     rib_radius = float(job["thickness"]) * h
     connect = max(2.2 * rib_radius + 0.5 * h, 1.25 * float(job["spacing"]) * h)
-    lines = trim_dangling(lines, anchors, connect, foot_radius + rib_radius)
+    trimmed = trim_dangling(lines, anchors, connect, foot_radius + rib_radius, join=rib_radius)
+    if not trimmed:
+        warnings.append("Few ribs connect to each other: raise the Resolution or lower Spacing")
+    lines = trimmed or lines
     check_stop(should_stop)
     field = SurfaceField(fine, fine_grid.origin, fine_grid.h)
     lines = lines + connector_ribs(

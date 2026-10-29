@@ -23,8 +23,7 @@ def mesh(field, origin, h):
 
 
 def n_components(verts, faces):
-    labels = mesher._component_labels(verts.shape[0], mesher.mesh_edges(faces))
-    return np.unique(labels[np.unique(faces)]).size
+    return np.unique(mesher.face_components(verts.shape[0], faces)).size
 
 
 def signed_volume(verts, faces):
@@ -188,7 +187,6 @@ def test_varying_radius_along_a_segment_and_no_beads_at_joints():
         f = f[:, 0, 0]
         k = np.flatnonzero(f >= ISO).max()
         x0 = (k + 0.5) * hx
-        x1 = x0 + hx
         crossing = x0 + (f[k] - ISO) / (f[k] - f[k + 1]) * hx
         assert crossing == pytest.approx(np.interp(zz, z, r), abs=2e-4)
     # a single segment with different end radii: f == ISO at d == r(t)
@@ -197,6 +195,22 @@ def test_varying_radius_along_a_segment_and_no_beads_at_joints():
         rad = 0.05 + 0.1 * x
         f, _ = field_at([seg], [[x, 0.0, rad]], 1e-3, 0.0)
         assert f[0] == pytest.approx(ISO, abs=1e-9)
+
+
+def test_long_segments_are_split_without_changing_the_field():
+    a = sculpt.Tube([[0.0, 0.0, 0.0], [1.2, 1.0, 0.8]], [0.03, 0.08], [0.0, 10.0])
+    n = 100
+    dense = sculpt.Tube(np.linspace([0, 0, 0], [1.2, 1.0, 0.8], n), np.linspace(0.03, 0.08, n),
+                        np.linspace(0.0, 10.0, n))
+    f1, origin, h, v1 = sculpt.tubes_field([a], 0.012, blend=0.5)
+    f2, v2 = sculpt.evaluate_tubes([dense], f1.shape, origin, h, 0.5)
+    assert np.abs(f1 - f2).max() < 1e-12
+    assert np.abs(v1 - v2)[f1 > 0].max() < 1e-9
+    part = sculpt._polyline_segments(a.points, a.radius, a.value, 0.1)
+    length, ext0, ext1 = part[2], part[7], part[8]
+    assert length.size == 18 and length.max() <= 0.1 + 1e-12
+    assert np.allclose(ext0[1:], 0.0) and np.allclose(ext1[:-1], 0.0)  # collinear joints
+    assert ext0[0] > 0.0 and ext1[-1] > 0.0  # round caps at the ends
 
 
 def test_single_point_tube_is_a_ball():
@@ -326,7 +340,7 @@ def test_coincident_and_coaxial_tubes_do_not_swell():
     inner = sculpt.Tube(line([0.1, 0, 0], [0.4, 0, 0], 5), 0.8 * R)
     for blend in (0.3, 1.0):
         f3, _ = sculpt.evaluate_tubes([t, inner], f1.shape, origin, h, blend)
-        verts, quads = mesh(f3, origin, h)
+        verts, _quads = mesh(f3, origin, h)
         body = (verts[:, 0] > 0.15) & (verts[:, 0] < 0.35)
         radius = np.linalg.norm(verts[body, 1:], axis=1)
         assert radius.max() < 1.02 * R
@@ -525,7 +539,7 @@ def test_progress_and_should_stop(monkeypatch):
 
 def test_thread_safe():
     tubes = random_tubes(10, 12, seed=8)
-    f0, origin, h, v0 = sculpt.tubes_field(tubes, 0.015, blend=0.5)
+    f0 = sculpt.tubes_field(tubes, 0.015, blend=0.5)[0]
     results = [None] * 4
 
     def work(k):
@@ -561,6 +575,41 @@ def test_duck_typed_tubes_and_forms_trees():
     assert values.max() == pytest.approx(tree.forces.max(), rel=1e-9)
 
 
+def test_branching_structure_surface_is_clean():
+    """A form-found tree, meshed and smoothed as the add-on does: one closed, smooth piece."""
+    from stress_sculpt.core import forms
+
+    pts = np.array([(x, y, 3.0) for x in (-1, 1) for y in (-1, 1)] + [(0, -1, 3.0), (0, 1, 3.0)], dtype=float)
+    settings = forms.TreeSettings(radius_min=0.04, radius_max=0.15, samples=10)
+    tree = forms.grow_tree(pts, np.tile([0.0, 0.0, -2000.0], (len(pts), 1)), settings, ground=0.0)
+    for blend in (0.0, 0.45, 1.0):
+        field, origin, h, _values = sculpt.tubes_field(tree.tubes(), 0.04 / 2.0, blend=blend)
+        verts, quads = mesh(field, origin, h)
+        verts, quads = mesher.remove_small_components(verts, quads, 16)
+        assert n_components(verts, quads) == 1
+        assert verts.shape[0] - mesher.mesh_edges(quads).shape[0] + quads.shape[0] == 2  # no handles
+        smooth = mesher.taubin_smooth(verts, quads, iterations=12)
+        assert signed_volume(smooth, quads) == pytest.approx(signed_volume(verts, quads), rel=0.02)
+        # every quad faces outwards (along -grad f): no folds, no inverted spikes
+        normal = np.cross(smooth[quads[:, 2]] - smooth[quads[:, 0]], smooth[quads[:, 3]] - smooth[quads[:, 1]])
+        centre = smooth[quads].mean(axis=1)
+        eps = 0.1 * h
+        grad = np.stack([mesher.sample_trilinear(field, origin, h, centre + eps * e)
+                         - mesher.sample_trilinear(field, origin, h, centre - eps * e) for e in np.eye(3)], 1)
+        assert np.all(np.einsum("ij,ij->i", normal, -grad) > 0.0)
+        # smooth: sharp creases only where members meet hard (blend 0)
+        tris = mesher.triangulate(quads)
+        n = np.cross(smooth[tris[:, 1]] - smooth[tris[:, 0]], smooth[tris[:, 2]] - smooth[tris[:, 0]])
+        n /= np.linalg.norm(n, axis=1, keepdims=True)
+        edges = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+        key = np.minimum(edges[:, 0], edges[:, 1]) * smooth.shape[0] + np.maximum(edges[:, 0], edges[:, 1])
+        pair = np.tile(np.arange(tris.shape[0]), 3)[np.argsort(key, kind="stable")].reshape(-1, 2)
+        dihedral = np.degrees(np.arccos(np.clip(np.einsum("ij,ij->i", n[pair[:, 0]], n[pair[:, 1]]), -1, 1)))
+        assert np.percentile(dihedral, 99) < 25.0
+        if blend > 0.0:
+            assert dihedral.max() < 75.0
+
+
 def test_memory_and_time_on_200_tubes():
     tubes = random_tubes(200, 40, seed=0, size=(3.0, 1.0, 1.2), r=(0.02, 0.05))
     voxel = 0.02
@@ -574,5 +623,5 @@ def test_memory_and_time_on_200_tubes():
     assert field.size > 500_000
     assert peak - outputs < 160e6  # temporaries are bounded, whatever the grid size
     assert elapsed < 20.0
-    verts, quads = mesh(field, origin, h)
+    _verts, quads = mesh(field, origin, h)
     assert quads.shape[0] > 10_000

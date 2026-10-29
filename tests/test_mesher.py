@@ -342,7 +342,7 @@ def test_smooth_noise_closed_manifold():
 def test_surface_nets_speed():
     field, origin, h = centred_field(96, sphere_sdf(0.8))
     t0 = time.perf_counter()
-    verts, quads = mesher.surface_nets(field, 0.0, origin, h)
+    _verts, quads = mesher.surface_nets(field, 0.0, origin, h)
     assert time.perf_counter() - t0 < 5.0
     assert quads.shape[0] > 10000
 
@@ -439,10 +439,57 @@ def test_remove_small_components():
     kept_v, kept_q = mesher.remove_small_components(verts, quads, min_faces=1)
     assert kept_q.shape[0] == quads.shape[0] and kept_v.shape[0] == verts.shape[0] - 1
     # everything below the threshold: the largest component survives
-    lone_v, lone_q = mesher.remove_small_components(verts, quads, min_faces=10**9)
+    _lone_v, lone_q = mesher.remove_small_components(verts, quads, min_faces=10**9)
     assert lone_q.shape == qb.shape
     ev, eq = mesher.remove_small_components(np.zeros((3, 3)), np.zeros((0, 4), dtype=np.int64), 5)
     assert ev.shape == (0, 3) and eq.shape == (0, 4)
+
+
+def test_remove_small_components_relative_threshold_index_and_validation():
+    parts = []
+    for k, n in enumerate((20, 8, 12)):  # three separate spheres
+        f, o, h = centred_field(n, sphere_sdf(0.6))
+        v, q = mesher.surface_nets(f, 0.0, o + 3.0 * k, h)
+        parts.append((v, q))
+    sizes = [q.shape[0] for _, q in parts]
+    offsets = np.cumsum([0] + [v.shape[0] for v, _ in parts])
+    verts = np.concatenate([v for v, _ in parts])
+    quads = np.concatenate([q + off for (_, q), off in zip(parts, offsets)])
+    # keep components with at least 40 % of the largest one's faces
+    frac = (sizes[2] / sizes[0] + sizes[1] / sizes[0]) / 2.0
+    v2, q2, kept = mesher.remove_small_components(verts, quads, 1, min_fraction=frac, return_index=True)
+    assert q2.shape[0] == sizes[0] + sizes[2] and q2.dtype == np.int64
+    assert np.array_equal(kept, np.r_[offsets[0]:offsets[1], offsets[2]:offsets[3]])
+    assert np.array_equal(v2, verts[kept])
+    assert_closed_manifold(v2, q2)
+    # the absolute threshold still applies; triangles work too
+    tris = mesher.triangulate(quads)
+    _v3, t3 = mesher.remove_small_components(verts, tris, 2 * sizes[2] + 1)
+    assert t3.shape == (2 * sizes[0], 3)
+    # ties: the component with the lowest vertex index wins
+    v4, _q4 = mesher.remove_small_components(
+        np.concatenate([parts[0][0], parts[0][0] + 5.0]),
+        np.concatenate([parts[0][1], parts[0][1] + parts[0][0].shape[0]]),
+        10**9,
+    )
+    assert np.allclose(v4, parts[0][0])
+    with pytest.raises(ValueError):
+        mesher.remove_small_components(verts, np.array([[0, 1, 2, verts.shape[0]]]), 1)
+    with pytest.raises(ValueError):
+        mesher.remove_small_components(verts, np.array([[0, 1, -1]]), 1)
+    ev, eq, ei = mesher.remove_small_components(verts, np.zeros((0, 3), dtype=np.int64), 1, return_index=True)
+    assert ev.shape == (0, 3) and eq.shape == (0, 3) and ei.shape == (0,)
+
+
+def test_face_components():
+    quads = np.array([[0, 1, 2, 3], [2, 3, 4, 5], [6, 7, 8, 9], [9, 10, 11, 12]])
+    labels = mesher.face_components(14, quads)  # vertex 13 unused
+    assert labels.dtype == np.int64 and np.array_equal(labels, [0, 0, 6, 6])
+    tris = np.array([[5, 6, 7], [0, 1, 2], [7, 8, 9]])  # touching at vertex 7 only
+    assert np.array_equal(mesher.face_components(10, tris), [5, 0, 5])
+    assert mesher.face_components(3, np.zeros((0, 3), dtype=np.int64)).shape == (0,)
+    with pytest.raises(ValueError):
+        mesher.face_components(3, np.array([[0, 1, 3]]))
 
 
 def test_component_labels_long_chain():
@@ -553,7 +600,7 @@ def test_extrapolate_reach_values_and_channels():
     out = mesher.extrapolate(field, mask, iterations=1)
     assert np.allclose(out[3, 1, 0], (2.0, 20.0))
     assert np.allclose(out[3, 0, 0], (1.0, 10.0))
-    values, valid = mesher._extrapolate(field, mask, 1)
+    _values, valid = mesher._extrapolate(field, mask, 1)
     # (3,0,0) has 4 in-grid neighbours, (3,2,0) has 5; (3,1,0) is shared
     assert valid.sum() == 2 + 4 + 5 - 1
     assert np.array_equal(mesher.extrapolate(field, np.zeros(shape, bool), 3), field)
