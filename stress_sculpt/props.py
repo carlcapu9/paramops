@@ -365,7 +365,7 @@ class StressSculptSceneSettings(PropertyGroup):
     symmetry_y: BoolProperty(name="Y", default=False, description="Mirror symmetry across the domain's Y mid-plane")
     symmetry_z: BoolProperty(name="Z", default=False, description="Mirror symmetry across the domain's Z mid-plane")
     iso_level: FloatProperty(name="Surface Level", default=0.5, min=0.05, max=0.95, subtype="FACTOR")
-    smooth_iterations: IntProperty(name="Smoothing", default=12, min=0, max=200)
+    smooth_iterations: IntProperty(name="Smoothing", default=20, min=0, max=200)
     live_update: BoolProperty(name="Live Preview", default=True, description="Update the shape at every iteration")
 
     # ----------------------------------------------------------- tension lines
