@@ -1,4 +1,9 @@
-"""Sidebar panels (View3D > Sidebar > Stress Sculpt), menus and the variants list."""
+"""Sidebar panels (View3D > Sidebar > Stress Sculpt), menus and the variants list.
+
+Main flow (panel "Structure"): pick the object, choose Support Object / Carve
+Inside and a style, put loads on selected vertices or faces, Generate. The other
+panels hold the stress analysis, the variants and the lower-level tools.
+"""
 
 import bpy
 from bpy.types import Menu, Panel, UIList
@@ -24,6 +29,10 @@ KIND_ICONS = {
     "LINES": "OUTLINER_DATA_CURVES",
     "SCULPT": "SCULPTMODE_HLT",
     "RELIEF": "MOD_DISPLACE",
+    "STRUCTURE": "MOD_BUILD",
+    "ORGANIC": "MOD_FLUIDSIM",
+    "BRANCHING": "OUTLINER_DATA_CURVES",
+    "RIBS": "MOD_LATTICE",
 }
 
 
@@ -65,9 +74,32 @@ def format_length(meters):
     return f"{meters:.3g} m"
 
 
-def _role_counts(scene):
+def format_force(newton):
+    value = abs(newton)
+    if value >= 1e6:
+        return f"{newton / 1e6:.3g} MN"
+    if value >= 1e3:
+        return f"{newton / 1e3:.3g} kN"
+    return f"{newton:.3g} N"
+
+
+def _role_objects(context, role):
+    """Enabled objects with ``role`` in the current view layer."""
+    objects = getattr(context, "view_layer", None)
+    pool = objects.objects if objects is not None else context.scene.objects
+    out = []
+    for obj in pool:
+        settings = getattr(obj, "stress_sculpt", None)
+        if settings is not None and settings.role == role and settings.enabled:
+            out.append(obj)
+    return out
+
+
+def _role_counts(context):
     counts = {}
-    for obj in scene.objects:
+    objects = getattr(context, "view_layer", None)
+    pool = objects.objects if objects is not None else context.scene.objects
+    for obj in pool:
         settings = getattr(obj, "stress_sculpt", None)
         if settings is None or settings.role == "NONE" or not settings.enabled:
             continue
@@ -98,10 +130,34 @@ def draw_job_status(layout):
 
 def _big_button(layout, operator, text, icon, enabled=True):
     row = layout.row()
-    row.scale_y = 1.5
+    row.scale_y = 1.6
     row.enabled = enabled and not _running()
     row.operator(operator, text=text, icon=icon)
     return row
+
+
+def _draw_last_result(layout, settings):
+    if not settings.last_kind:
+        return
+    box = layout.box()
+    kind = settings.last_kind
+    box.label(text=f"Last result: {kind.replace('_', ' ').title()}", icon=KIND_ICONS.get(kind, "INFO"))
+    grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
+    if settings.last_max_stress:
+        grid.label(text="Max stress")
+        grid.label(text=format_stress(settings.last_max_stress))
+    if settings.last_max_displacement:
+        grid.label(text="Max displacement")
+        grid.label(text=format_length(settings.last_max_displacement))
+    if settings.last_compliance:
+        grid.label(text="Compliance")
+        grid.label(text=f"{settings.last_compliance:.4g} J")
+    if kind != "ANALYSIS" and settings.last_volume:
+        grid.label(text="Material")
+        grid.label(text=f"{settings.last_volume * 100:.1f} %")
+    if settings.last_iterations:
+        grid.label(text="Iterations")
+        grid.label(text=str(settings.last_iterations))
 
 
 class _StressSculptPanel:
@@ -121,7 +177,7 @@ class STRESS_SCULPT_MT_add_zone(Menu):
 
 class STRESS_SCULPT_MT_demo(Menu):
     bl_idname = "STRESS_SCULPT_MT_demo"
-    bl_label = "Demo Scene"
+    bl_label = "Examples"
 
     def draw(self, _context):
         self.layout.operator_enum("stress_sculpt.demo_scene", "preset")
@@ -135,79 +191,213 @@ class STRESS_SCULPT_MT_add(Menu):
 
     def draw(self, _context):
         layout = self.layout
-        layout.operator("stress_sculpt.add_support", text="Support", icon="PINNED")
         layout.operator("stress_sculpt.add_load", text="Load", icon="FORCE_FORCE")
+        layout.operator("stress_sculpt.add_support", text="Support", icon="PINNED")
         layout.separator()
         layout.operator_enum("stress_sculpt.add_zone", "role")
         layout.separator()
         layout.menu(STRESS_SCULPT_MT_demo.bl_idname, icon="PRESET")
 
 
+class STRESS_SCULPT_MT_edit_mesh(Menu):
+    """Edit Mode right-click menu > Stress Sculpt."""
+
+    bl_idname = "STRESS_SCULPT_MT_edit_mesh"
+    bl_label = "Stress Sculpt"
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.operator("stress_sculpt.add_load_at_selection", text="Put Weight on Selection", icon="FORCE_FORCE")
+        layout.operator("stress_sculpt.add_support_at_selection", text="Support at Selection", icon="PINNED")
+
+
 def _draw_add_menu(self, _context):
     self.layout.menu(STRESS_SCULPT_MT_add.bl_idname, icon="FORCE_FORCE")
 
 
-# --------------------------------------------------------------------------- setup
-class STRESS_SCULPT_PT_setup(_StressSculptPanel, Panel):
-    bl_idname = "STRESS_SCULPT_PT_setup"
-    bl_label = "Setup"
+def _draw_edit_menu(self, _context):
+    self.layout.separator()
+    self.layout.menu(STRESS_SCULPT_MT_edit_mesh.bl_idname, icon="FORCE_FORCE")
+
+
+# --------------------------------------------------------------------------- structure (main)
+class STRESS_SCULPT_PT_structure(_StressSculptPanel, Panel):
+    bl_idname = "STRESS_SCULPT_PT_structure"
+    bl_label = "Structure"
+
+    def draw_header_preset(self, _context):
+        self.layout.menu(STRESS_SCULPT_MT_demo.bl_idname, text="", icon="PRESET")
 
     def draw(self, context):
         layout = self.layout
-        layout.use_property_split = False
         settings = context.scene.stress_sculpt
         running = draw_job_status(layout)
 
+        # object
         col = layout.column(align=True)
-        col.label(text="Design Domain", icon="MESH_CUBE")
         row = col.row(align=True)
-        row.prop(settings, "domain", text="")
-        row.operator("stress_sculpt.set_domain", text="", icon="EYEDROPPER")
-        if settings.domain is None:
+        row.prop(settings, "target", text="")
+        row.operator("stress_sculpt.set_target", text="", icon="EYEDROPPER")
+        if settings.target is None:
             box = layout.box()
-            box.label(text="Pick a closed mesh as domain,", icon="INFO")
-            box.label(text="or start from a demo scene.")
-            box.menu(STRESS_SCULPT_MT_demo.bl_idname, text="Demo Scene", icon="PRESET")
+            box.label(text="Pick the mesh to work with,", icon="INFO")
+            box.label(text="or start from an example.")
+            box.menu(STRESS_SCULPT_MT_demo.bl_idname, text="Examples", icon="PRESET")
 
-        col = layout.column(align=True)
+        layout.row().prop(settings, "structure_mode", expand=True)
+        layout.row().prop(settings, "structure_style", expand=True)
+
+        counts = _role_counts(context)
+        n_loads = counts.get("LOAD", 0)
+        n_supports = counts.get("SUPPORT", 0)
+
+        # loads
+        box = layout.box()
+        row = box.row(align=True)
+        row.label(text=f"Weights: {n_loads}", icon="FORCE_FORCE")
+        sub = row.row(align=True)
+        sub.operator("stress_sculpt.select_role", text="", icon="RESTRICT_SELECT_OFF").role = "LOAD"
+        sub.operator("stress_sculpt.remove_role", text="", icon="TRASH").role = "LOAD"
+        col = box.column(align=True)
         col.enabled = not running
-        col.prop(settings, "resolution")
-        col.prop(settings, "voxelize_method", text="")
+        in_edit = context.mode == "EDIT_MESH"
+        row = col.row(align=True)
+        row.scale_y = 1.2
+        row.operator(
+            "stress_sculpt.add_load_at_selection",
+            text="Put Weight on Selection" if in_edit else "Weight on Selection (Edit Mode)",
+            icon="FORCE_FORCE",
+        )
+        if not in_edit:
+            col.label(text="Tab into Edit Mode, select points or faces", icon="INFO")
+        loads = _role_objects(context, "LOAD")
+        if loads:
+            total = sum(obj.stress_sculpt.magnitude for obj in loads)
+            box.label(text=f"Total weight {format_force(total)}")
 
-        col = layout.column(align=True)
-        col.prop(settings, "material_preset")
-        if settings.material_preset == "CUSTOM":
-            col.prop(settings, "youngs_modulus")
-            col.prop(settings, "poisson_ratio")
+        # supports
+        box = layout.box()
+        if settings.structure_mode == "SUPPORT":
+            row = box.row(align=True)
+            row.label(text="Ground", icon="VIEW_PERSPECTIVE")
+            row.prop(settings, "ground_height", text="")
+            box.row().prop(settings, "ground_contact", expand=True)
+            if settings.ground_contact == "FOOTINGS":
+                if n_supports:
+                    row = box.row(align=True)
+                    row.label(text=f"Footings: {n_supports} support(s)", icon="PINNED")
+                    row.operator("stress_sculpt.remove_role", text="", icon="TRASH").role = "SUPPORT"
+                else:
+                    box.prop(settings, "footings", text="Footings (0 = auto)")
+            box.operator("stress_sculpt.add_support_at_selection", text="Footing at Selection", icon="PINNED")
         else:
-            col.label(text=f"E = {settings.youngs_modulus:g} GPa   ν = {settings.poisson_ratio:.2f}")
+            row = box.row(align=True)
+            row.label(text=f"Supports: {n_supports}", icon="PINNED")
+            sub = row.row(align=True)
+            sub.operator("stress_sculpt.select_role", text="", icon="RESTRICT_SELECT_OFF").role = "SUPPORT"
+            sub.operator("stress_sculpt.remove_role", text="", icon="TRASH").role = "SUPPORT"
+            box.operator("stress_sculpt.add_support_at_selection", text="Support at Selection", icon="PINNED")
+            if not n_supports:
+                box.label(text="Anchor the block where it rests", icon="ERROR")
 
-        layout.separator()
+        if settings.target is not None and not n_loads:
+            layout.label(text="Put weight on at least one point", icon="ERROR")
+
+        _big_button(layout, "stress_sculpt.generate", "Generate Structure", "MOD_BUILD")
+        _draw_last_result(layout, settings)
+
+
+class STRESS_SCULPT_PT_style(_StressSculptPanel, Panel):
+    bl_idname = "STRESS_SCULPT_PT_style"
+    bl_label = "Style Settings"
+    bl_parent_id = "STRESS_SCULPT_PT_structure"
+
+    def draw_header(self, context):
+        style = context.scene.stress_sculpt.structure_style
+        self.layout.label(text="", icon=KIND_ICONS.get(style, "MOD_BUILD"))
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.stress_sculpt
+        style = settings.structure_style
+        if style == "BRANCHING":
+            self._branching(layout, settings)
+        else:
+            self._organic(layout, settings)
+            if style == "RIBS":
+                self._ribs(layout, settings)
+
+    @staticmethod
+    def _organic(layout, settings):
         col = layout.column(align=True)
-        col.label(text="Forces & Zones", icon="FORCE_FORCE")
-        row = col.row(align=True)
-        row.operator("stress_sculpt.add_support", text="Support", icon="PINNED")
-        row.operator("stress_sculpt.add_load", text="Load", icon="FORCE_FORCE")
-        row = col.row(align=True)
-        row.menu(STRESS_SCULPT_MT_add_zone.bl_idname, text="Zone", icon="ADD")
-        row.menu(STRESS_SCULPT_MT_demo.bl_idname, text="Demo", icon="PRESET")
-
-        counts = _role_counts(context.scene)
-        n_zones = sum(counts.get(role, 0) for role in ZONE_ROLES)
+        if settings.structure_mode == "SUPPORT":
+            col.prop(settings, "support_material")
+        else:
+            col.prop(settings, "volume_fraction")
+        col.prop(settings, "resolution")
+        col.prop(settings, "filter_radius")
+        col.prop(settings, "max_iterations")
+        col.prop(settings, "load_pad")
         row = layout.row(align=True)
-        row.label(text=str(counts.get("SUPPORT", 0)), icon="PINNED")
-        row.label(text=str(counts.get("LOAD", 0)), icon="FORCE_FORCE")
-        row.label(text=str(n_zones), icon="MOD_MASK")
-        if settings.domain is not None and counts.get("SUPPORT", 0) == 0:
-            layout.label(text="Add at least one support", icon="ERROR")
-        if settings.domain is not None and counts.get("LOAD", 0) == 0:
-            layout.label(text="Add at least one load", icon="ERROR")
+        row.label(text="Symmetry")
+        row.prop(settings, "symmetry_x", toggle=True)
+        row.prop(settings, "symmetry_y", toggle=True)
+        row.prop(settings, "symmetry_z", toggle=True)
+        col = layout.column(align=True)
+        col.prop(settings, "smooth_iterations")
+        col.prop(settings, "live_update")
+        layout.prop(settings, "show_advanced", icon="PREFERENCES", toggle=True)
+        if settings.show_advanced:
+            col = layout.column(align=True)
+            col.prop(settings, "evo_mode")
+            if settings.evo_mode == "SIMP":
+                col.prop(settings, "penalty")
+                col.prop(settings, "move_limit")
+            else:
+                col.prop(settings, "grow_threshold")
+                col.prop(settings, "hollow_threshold")
+                col.prop(settings, "growth_rate")
+                col.prop(settings, "keep_volume")
+            col.prop(settings, "min_change")
+            col.prop(settings, "iso_level")
+
+    @staticmethod
+    def _branching(layout, settings):
+        col = layout.column(align=True)
+        col.prop(settings, "tree_branching")
+        col.prop(settings, "tree_split")
+        col.prop(settings, "tree_levels")
+        col.prop(settings, "tree_organic")
+        col = layout.column(align=True)
+        col.label(text="Members (sized by their force)")
+        col.prop(settings, "tree_thickness")
+        col.prop(settings, "tree_min_thickness")
+        col.prop(settings, "tree_footing_flare")
+        col.prop(settings, "tree_capital_flare")
+        col = layout.column(align=True)
+        col.prop(settings, "tree_blend")
+        col.prop(settings, "tree_detail")
+        col.prop(settings, "smooth_iterations")
+
+    @staticmethod
+    def _ribs(layout, settings):
+        col = layout.column(align=True)
+        col.label(text="Ribs", icon="MOD_LATTICE")
+        if settings.structure_mode == "CARVE":
+            col.prop(settings, "rib_source", text="")
+        col.prop(settings, "line_families", text="")
+        col.prop(settings, "rib_spacing")
+        col.prop(settings, "rib_thickness")
+        col.prop(settings, "rib_min_thickness")
+        col.prop(settings, "rib_skin")
+        col.prop(settings, "sculpt_blend")
 
 
 class STRESS_SCULPT_PT_active_object(_StressSculptPanel, Panel):
     bl_idname = "STRESS_SCULPT_PT_active_object"
     bl_label = "Active Object"
-    bl_parent_id = "STRESS_SCULPT_PT_setup"
+    bl_parent_id = "STRESS_SCULPT_PT_structure"
+    bl_options = {"DEFAULT_CLOSED"}
 
     @classmethod
     def poll(cls, context):
@@ -223,8 +413,11 @@ class STRESS_SCULPT_PT_active_object(_StressSculptPanel, Panel):
         obj = context.active_object
         settings = context.scene.stress_sculpt
         layout.label(text=obj.name)
+        if obj == settings.target:
+            layout.label(text="This is the working object", icon="MESH_CUBE")
+            return
         if settings.domain is not None and obj == settings.domain:
-            layout.label(text="This mesh is the design domain", icon="MESH_CUBE")
+            layout.label(text="This mesh is the analysis domain", icon="MESH_CUBE")
             return
 
         ob_settings = obj.stress_sculpt
@@ -232,7 +425,7 @@ class STRESS_SCULPT_PT_active_object(_StressSculptPanel, Panel):
         role = ob_settings.role
         if role == "NONE":
             if obj.type == "MESH":
-                layout.operator("stress_sculpt.set_domain", text="Use as Domain", icon="MESH_CUBE")
+                layout.operator("stress_sculpt.set_target", text="Use as Object", icon="MESH_CUBE")
             return
 
         layout.prop(ob_settings, "enabled")
@@ -261,161 +454,28 @@ class STRESS_SCULPT_PT_active_object(_StressSculptPanel, Panel):
             layout.label(text="The mesh interior is the zone", icon="INFO")
 
 
-# --------------------------------------------------------------------------- analyze
+# --------------------------------------------------------------------------- analysis
 class STRESS_SCULPT_PT_analyze(_StressSculptPanel, Panel):
     bl_idname = "STRESS_SCULPT_PT_analyze"
-    bl_label = "Analyze"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.stress_sculpt
-        col = layout.column(align=True)
-        col.prop(settings, "stress_measure")
-        col.prop(settings, "colormap")
-        col.prop(settings, "color_clip")
-        col.prop(settings, "heatmap_on_original")
-        _big_button(layout, "stress_sculpt.analyze", "Analyze Stress", "PLAY")
-
-        if settings.last_kind:
-            box = layout.box()
-            box.label(text=f"Last result: {settings.last_kind.title()}", icon=KIND_ICONS.get(settings.last_kind, "INFO"))
-            grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
-            grid.label(text="Max stress")
-            grid.label(text=format_stress(settings.last_max_stress))
-            grid.label(text="Max displacement")
-            grid.label(text=format_length(settings.last_max_displacement))
-            grid.label(text="Compliance")
-            grid.label(text=f"{settings.last_compliance:.4g} J")
-            if settings.last_kind != "ANALYSIS":
-                grid.label(text="Material")
-                grid.label(text=f"{settings.last_volume * 100:.1f} %")
-            if settings.last_iterations:
-                grid.label(text="Iterations")
-                grid.label(text=str(settings.last_iterations))
-
-
-# --------------------------------------------------------------------------- evolve
-class STRESS_SCULPT_PT_evolve(_StressSculptPanel, Panel):
-    bl_idname = "STRESS_SCULPT_PT_evolve"
-    bl_label = "Evolve"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.stress_sculpt
-        layout.row().prop(settings, "evo_mode", expand=True)
-
-        col = layout.column(align=True)
-        col.prop(settings, "volume_fraction")
-        col.prop(settings, "max_iterations")
-        col.prop(settings, "filter_radius")
-
-        if settings.evo_mode == "RULES":
-            col = layout.column(align=True)
-            col.label(text="Growth Rules")
-            col.prop(settings, "grow_threshold")
-            col.prop(settings, "hollow_threshold")
-            col.prop(settings, "growth_rate")
-            col.prop(settings, "keep_volume")
-            if settings.hollow_threshold >= settings.grow_threshold:
-                col.label(text="'Hollow Below' should be lower than 'Thicken Above'", icon="ERROR")
-
-        row = layout.row(align=True)
-        row.label(text="Symmetry")
-        row.prop(settings, "symmetry_x", toggle=True)
-        row.prop(settings, "symmetry_y", toggle=True)
-        row.prop(settings, "symmetry_z", toggle=True)
-
-        col = layout.column(align=True)
-        col.prop(settings, "iso_level")
-        col.prop(settings, "smooth_iterations")
-        col.prop(settings, "live_update")
-
-        layout.prop(settings, "show_advanced", icon="PREFERENCES", toggle=True)
-        if settings.show_advanced:
-            col = layout.column(align=True)
-            if settings.evo_mode == "SIMP":
-                col.prop(settings, "penalty")
-                col.prop(settings, "move_limit")
-            col.prop(settings, "min_change")
-
-        _big_button(layout, "stress_sculpt.evolve", "Evolve Shape", "MOD_REMESH")
-
-
-# --------------------------------------------------------------------------- tension lines
-class STRESS_SCULPT_PT_lines(_StressSculptPanel, Panel):
-    bl_idname = "STRESS_SCULPT_PT_lines"
-    bl_label = "Tension Lines"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.stress_sculpt
-        col = layout.column(align=True)
-        col.prop(settings, "line_source")
-        col.prop(settings, "line_families")
-
-        col = layout.column(align=True)
-        col.prop(settings, "n_seeds")
-        col.prop(settings, "seed_from_loads")
-        col.prop(settings, "line_separation")
-        col.prop(settings, "line_min_stress")
-
-        col = layout.column(align=True)
-        col.label(text="Branching")
-        col.prop(settings, "branch_depth")
-        sub = col.column(align=True)
-        sub.active = settings.branch_depth > 0
-        sub.prop(settings, "branch_spacing")
-        sub.prop(settings, "branch_ratio")
-        sub.prop(settings, "branch_taper")
-
-        col = layout.column(align=True)
-        col.label(text="Thickness")
-        row = col.row(align=True)
-        row.prop(settings, "radius_min", text="Min")
-        row.prop(settings, "radius_max", text="Max")
-
-        if settings.show_advanced:
-            col = layout.column(align=True)
-            col.prop(settings, "line_step")
-            col.prop(settings, "random_seed")
-
-        _big_button(layout, "stress_sculpt.trace_lines", "Trace Tension Lines", "OUTLINER_DATA_CURVES")
-
-
-# --------------------------------------------------------------------------- sculpture
-class STRESS_SCULPT_PT_sculpture(_StressSculptPanel, Panel):
-    bl_idname = "STRESS_SCULPT_PT_sculpture"
-    bl_label = "Sculpture"
-
-    def draw(self, context):
-        layout = self.layout
-        settings = context.scene.stress_sculpt
-        col = layout.column(align=True)
-        col.prop(settings, "sculpt_source")
-        col.prop(settings, "sculpt_detail")
-        col.prop(settings, "sculpt_blend")
-        col.prop(settings, "sculpt_smooth")
-        layout.label(text="Traces the lines first if needed", icon="INFO")
-        _big_button(layout, "stress_sculpt.sculpt", "Sculpt from Lines", "SCULPTMODE_HLT")
-
-
-# --------------------------------------------------------------------------- relief
-class STRESS_SCULPT_PT_relief(_StressSculptPanel, Panel):
-    bl_idname = "STRESS_SCULPT_PT_relief"
-    bl_label = "Relief"
+    bl_label = "Stress Analysis"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.stress_sculpt
         col = layout.column(align=True)
-        col.prop(settings, "relief_amount")
-        col.prop(settings, "relief_hollow")
-        col.prop(settings, "relief_threshold")
-        col.prop(settings, "relief_gamma")
-        col.prop(settings, "relief_subdivisions")
-        col.prop(settings, "relief_smooth")
-        _big_button(layout, "stress_sculpt.relief", "Thicken Surface", "MOD_DISPLACE")
+        row = col.row(align=True)
+        row.prop(settings, "domain", text="Analyze")
+        row.operator("stress_sculpt.set_domain", text="", icon="EYEDROPPER")
+        col.prop(settings, "resolution")
+        col.prop(settings, "voxelize_method", text="")
+        col = layout.column(align=True)
+        col.prop(settings, "stress_measure")
+        col.prop(settings, "colormap")
+        col.prop(settings, "color_clip")
+        col.prop(settings, "heatmap_on_original")
+        _big_button(layout, "stress_sculpt.analyze", "Analyze Stress", "PLAY")
+        layout.operator("stress_sculpt.verify", text="Check Generated Structure", icon="CHECKMARK")
 
 
 # --------------------------------------------------------------------------- variants
@@ -431,7 +491,7 @@ class STRESS_SCULPT_UL_variants(UIList):
             row.prop(item, "name", text="", emboss=False, icon=icon)
             sub = row.row(align=True)
             sub.alignment = "RIGHT"
-            if item.kind and item.kind != "ANALYSIS":
+            if item.kind and item.kind != "ANALYSIS" and item.volume:
                 sub.label(text=f"{item.volume * 100:.0f}%")
             if item.compliance:
                 sub.label(text=f"C {item.compliance:.3g}")
@@ -451,7 +511,7 @@ class STRESS_SCULPT_PT_variants(_StressSculptPanel, Panel):
         row = layout.row()
         row.template_list(
             STRESS_SCULPT_UL_variants.bl_idname, "", settings, "variants",
-            settings, "active_variant_index", rows=4,
+            settings, "active_variant_index", rows=3,
         )
         col = row.column(align=True)
         col.operator("stress_sculpt.variant_save", text="", icon="ADD")
@@ -467,14 +527,16 @@ class STRESS_SCULPT_PT_variants(_StressSculptPanel, Panel):
             grid = box.grid_flow(row_major=True, columns=2, even_columns=True, align=True)
             if variant.kind:
                 grid.label(text="Kind")
-                grid.label(text=variant.kind.title())
-            if variant.kind != "ANALYSIS":
+                grid.label(text=variant.kind.replace("_", " ").title())
+            if variant.kind != "ANALYSIS" and variant.volume:
                 grid.label(text="Material")
                 grid.label(text=f"{variant.volume * 100:.1f} %")
-            grid.label(text="Compliance")
-            grid.label(text=f"{variant.compliance:.4g} J")
-            grid.label(text="Max stress")
-            grid.label(text=format_stress(variant.max_stress))
+            if variant.compliance:
+                grid.label(text="Compliance")
+                grid.label(text=f"{variant.compliance:.4g} J")
+            if variant.max_stress:
+                grid.label(text="Max stress")
+                grid.label(text=format_stress(variant.max_stress))
             if variant.max_displacement:
                 grid.label(text="Max displacement")
                 grid.label(text=format_length(variant.max_displacement))
@@ -487,26 +549,78 @@ class STRESS_SCULPT_PT_variants(_StressSculptPanel, Panel):
         col = layout.column(align=True)
         row = col.row(align=True)
         row.enabled = len(settings.variants) > 0
-        row.operator("stress_sculpt.variant_compare", text="Compare", icon="VIEW_ORTHO")
+        row.operator("stress_sculpt.variant_compare", text="Compare Side by Side", icon="VIEW_ORTHO")
         row.operator("stress_sculpt.variant_clear_compare", text="", icon="X")
         col.prop(settings, "compare_spacing")
+
+
+# --------------------------------------------------------------------------- more tools
+class STRESS_SCULPT_PT_tools(_StressSculptPanel, Panel):
+    bl_idname = "STRESS_SCULPT_PT_tools"
+    bl_label = "More Tools"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw(self, context):
+        layout = self.layout
+        settings = context.scene.stress_sculpt
+
+        col = layout.column(align=True)
+        col.label(text="Zones", icon="MOD_MASK")
+        row = col.row(align=True)
+        row.menu(STRESS_SCULPT_MT_add_zone.bl_idname, text="Add Zone", icon="ADD")
+        row.operator("stress_sculpt.add_load", text="Load", icon="FORCE_FORCE")
+        row.operator("stress_sculpt.add_support", text="Support", icon="PINNED")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Stress Lines", icon="OUTLINER_DATA_CURVES")
+        col.prop(settings, "line_source", text="")
+        col.prop(settings, "line_families", text="")
+        col.prop(settings, "n_seeds")
+        col.prop(settings, "line_separation")
+        col.prop(settings, "line_min_stress")
+        col.prop(settings, "branch_depth")
+        row = col.row(align=True)
+        row.prop(settings, "radius_min", text="Min")
+        row.prop(settings, "radius_max", text="Max")
+        row = layout.row(align=True)
+        row.enabled = not _running()
+        row.operator("stress_sculpt.trace_lines", text="Trace Lines", icon="OUTLINER_DATA_CURVES")
+        row.operator("stress_sculpt.sculpt", text="Fuse Lines", icon="SCULPTMODE_HLT")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Relief", icon="MOD_DISPLACE")
+        col.prop(settings, "relief_amount")
+        col.prop(settings, "relief_hollow")
+        col.prop(settings, "relief_threshold")
+        col.prop(settings, "relief_subdivisions")
+        row = layout.row()
+        row.enabled = not _running()
+        row.operator("stress_sculpt.relief", text="Thicken Surface by Stress", icon="MOD_DISPLACE")
 
 
 # --------------------------------------------------------------------------- solver
 class STRESS_SCULPT_PT_solver(_StressSculptPanel, Panel):
     bl_idname = "STRESS_SCULPT_PT_solver"
-    bl_label = "Solver"
+    bl_label = "Material & Solver"
     bl_options = {"DEFAULT_CLOSED"}
 
     def draw(self, context):
         layout = self.layout
         settings = context.scene.stress_sculpt
         col = layout.column(align=True)
+        col.prop(settings, "material_preset")
+        if settings.material_preset == "CUSTOM":
+            col.prop(settings, "youngs_modulus")
+            col.prop(settings, "poisson_ratio")
+        else:
+            col.label(text=f"E = {settings.youngs_modulus:g} GPa   ν = {settings.poisson_ratio:.2f}")
+        col = layout.column(align=True)
         col.prop(settings, "solver")
         col.prop(settings, "solver_tolerance")
         col.prop(settings, "max_solver_iterations")
         layout.prop(settings, "domain_as_wire")
-        layout.prop(settings, "show_advanced")
         row = layout.row()
         row.enabled = not _running()
         row.operator("stress_sculpt.clear_results", text="Clear Results", icon="TRASH")
@@ -516,15 +630,14 @@ classes = (
     STRESS_SCULPT_MT_add_zone,
     STRESS_SCULPT_MT_demo,
     STRESS_SCULPT_MT_add,
+    STRESS_SCULPT_MT_edit_mesh,
     STRESS_SCULPT_UL_variants,
-    STRESS_SCULPT_PT_setup,
+    STRESS_SCULPT_PT_structure,
+    STRESS_SCULPT_PT_style,
     STRESS_SCULPT_PT_active_object,
     STRESS_SCULPT_PT_analyze,
-    STRESS_SCULPT_PT_evolve,
-    STRESS_SCULPT_PT_lines,
-    STRESS_SCULPT_PT_sculpture,
-    STRESS_SCULPT_PT_relief,
     STRESS_SCULPT_PT_variants,
+    STRESS_SCULPT_PT_tools,
     STRESS_SCULPT_PT_solver,
 )
 
@@ -533,9 +646,11 @@ def register():
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy.types.VIEW3D_MT_add.append(_draw_add_menu)
+    bpy.types.VIEW3D_MT_edit_mesh_context_menu.append(_draw_edit_menu)
 
 
 def unregister():
+    bpy.types.VIEW3D_MT_edit_mesh_context_menu.remove(_draw_edit_menu)
     bpy.types.VIEW3D_MT_add.remove(_draw_add_menu)
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

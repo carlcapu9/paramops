@@ -114,6 +114,124 @@ class StressSculptVariant(PropertyGroup):
 
 
 class StressSculptSceneSettings(PropertyGroup):
+    # ------------------------------------------------------------ structure (main flow)
+    target: PointerProperty(
+        name="Object",
+        type=bpy.types.Object,
+        poll=_poll_mesh,
+        description="The mesh you work with: the object to hold up, or the block to carve the structure from",
+    )
+    structure_mode: EnumProperty(
+        name="Mode",
+        items=[
+            ("SUPPORT", "Support Object", "The object is carried: a structure grows from the ground up to the loaded points", "TRIA_UP", 0),
+            ("CARVE", "Carve Inside", "The object is the block of material: the structure forms inside it", "MOD_BOOLEAN", 1),
+        ],
+        default="SUPPORT",
+    )
+    structure_style: EnumProperty(
+        name="Style",
+        items=[
+            ("ORGANIC", "Organic", "Topology optimization: fluid, continuous shapes where material follows the forces", "MOD_FLUIDSIM", 0),
+            ("BRANCHING", "Branching", "Tree columns that split towards the loads; members sized by the force they carry", "OUTLINER_DATA_CURVES", 1),
+            ("RIBS", "Ribs", "A lattice of ribs following the principal stress lines over the optimized shape", "MOD_LATTICE", 2),
+        ],
+        default="BRANCHING",
+    )
+    ground_height: FloatProperty(
+        name="Ground",
+        default=0.0,
+        subtype="DISTANCE",
+        description="Height of the ground the structure stands on (Support Object mode)",
+    )
+    ground_contact: EnumProperty(
+        name="Ground Contact",
+        items=[
+            ("FOOTINGS", "Footings", "The structure lands on a few footings (support empties, or placed automatically)"),
+            ("FULL", "Whole Ground", "The structure may touch the ground anywhere"),
+        ],
+        default="FOOTINGS",
+    )
+    footings: IntProperty(
+        name="Footings",
+        default=0,
+        min=0,
+        max=16,
+        description="Number of automatic footings when no Support empties exist (0 = automatic)",
+    )
+    support_material: FloatProperty(
+        name="Material",
+        default=0.07,
+        min=0.01,
+        max=0.6,
+        subtype="FACTOR",
+        description="Fraction of the free space between ground and object the organic structure may fill",
+    )
+    load_pad: FloatProperty(
+        name="Contact Size",
+        default=1.5,
+        min=0.5,
+        max=6.0,
+        description="Radius in voxels of the solid contact pads kept at every load and footing",
+    )
+    # branching
+    tree_branching: IntProperty(name="Branches per Split", default=2, min=2, max=4)
+    tree_split: FloatProperty(
+        name="Trunk Height", default=0.35, min=0.02, max=0.95, subtype="FACTOR",
+        description="Where the trunk first splits, as a fraction of the height",
+    )
+    tree_levels: FloatProperty(
+        name="Split Rhythm", default=1.0, min=0.2, max=4.0,
+        description="Above 1 the splits crowd near the loads, below 1 near the ground",
+    )
+    tree_organic: FloatProperty(
+        name="Flow", default=0.6, min=0.0, max=1.0, subtype="FACTOR",
+        description="0 = straight members, 1 = strongly curved, flowing branches",
+    )
+    tree_thickness: FloatProperty(
+        name="Thickness", default=0.05, min=0.002, max=0.5, subtype="FACTOR",
+        description="Radius of the most loaded member as a fraction of the structure's height",
+    )
+    tree_min_thickness: FloatProperty(
+        name="Thinnest", default=0.25, min=0.02, max=1.0, subtype="FACTOR",
+        description="Radius of the least loaded members relative to the thickest one",
+    )
+    tree_footing_flare: FloatProperty(name="Footing Flare", default=1.5, min=1.0, max=4.0)
+    tree_capital_flare: FloatProperty(name="Capital Flare", default=1.8, min=1.0, max=5.0)
+    tree_blend: FloatProperty(
+        name="Junction Blend", default=0.45, min=0.0, max=1.0, subtype="FACTOR",
+        description="How softly members melt into each other at the junctions",
+    )
+    tree_detail: FloatProperty(
+        name="Detail", default=2.5, min=1.0, max=6.0,
+        description="Surface voxels across the thinnest member radius (higher = smoother, slower)",
+    )
+    # ribs
+    rib_source: EnumProperty(
+        name="Ribs On",
+        items=[
+            ("EVOLVED", "Optimized Shape", "Ribs follow the stress lines over the organically optimized structure"),
+            ("SURFACE", "Object Surface", "Ribs follow the stress lines over the object's own surface (Carve mode)"),
+        ],
+        default="EVOLVED",
+    )
+    rib_spacing: FloatProperty(
+        name="Spacing", default=3.0, min=1.0, max=20.0,
+        description="Distance between neighbouring ribs, in voxels",
+    )
+    rib_thickness: FloatProperty(
+        name="Thickness", default=0.6, min=0.1, max=5.0,
+        description="Radius of the most stressed rib, in voxels",
+    )
+    rib_min_thickness: FloatProperty(
+        name="Thinnest", default=0.35, min=0.05, max=1.0, subtype="FACTOR",
+        description="Radius of the least stressed ribs relative to the thickest one",
+    )
+    rib_skin: FloatProperty(
+        name="Skin", default=0.0, min=0.0, max=4.0,
+        description="Thickness in voxels of a shell under the ribs (0 = open lattice)",
+    )
+
     # ------------------------------------------------------------------ setup
     domain: PointerProperty(
         name="Domain",

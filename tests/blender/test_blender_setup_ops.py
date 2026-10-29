@@ -58,7 +58,7 @@ def test_operators_reregister_cleanly(scene):
 def test_full_addon_registration(addon):
     if addon != "full":
         pytest.skip("the package registration (__init__/ui/translations) is not available")
-    assert hasattr(bpy.types, "STRESS_SCULPT_PT_setup")
+    assert hasattr(bpy.types, "STRESS_SCULPT_PT_structure")
 
 
 def _selected(scene):
