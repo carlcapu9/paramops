@@ -666,3 +666,27 @@ def test_organic_field_meshes_the_smooth_density_at_the_same_volume():
         return float(np.mean(1.0 - np.sum(g[quads[:, 0]] * g[quads[:, 2]], axis=1)))
 
     assert roughness(matched) < roughness(stepped)
+
+
+def test_tree_forks_have_no_waist(scene):
+    """Members end no thinner than the branches they split into; hidden roots do not
+    set the meshing voxel."""
+    require_style("BRANCHING")
+    assert bpy.ops.stress_sculpt.demo_scene(preset="FLOATING_CUBE") == {"FINISHED"}
+    request = operators.structure_request(bpy.context, scene.stress_sculpt)
+    job, forms = request["branching"], request["modules"]["forms"]
+    tree = forms.grow_tree(
+        np.asarray(job["points"]),
+        np.asarray(job["forces"]),
+        operators.tree_settings(forms, job["tree"], job["radius_max"]),
+        supports=job["supports"],
+        ground=job["ground"],
+    )
+    radii = operators.taper_members(tree)
+    nominal = np.asarray(tree.radii)
+    for e, (_a, b) in enumerate(tree.edges):
+        kids = [k for k, (a, _b) in enumerate(tree.edges) if a == b]
+        if kids:
+            assert radii[e][-1] >= max(nominal[k] for k in kids) - 1e-9
+    thinnest = operators.visible_thinnest(tree, radii)
+    assert 0.7 * float(nominal.min()) <= thinnest <= float(nominal.min()) + 1e-9

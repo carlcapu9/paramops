@@ -2393,6 +2393,7 @@ ORGANIC_OPENING = 0  # grey opening radius in fine voxels: removes webs thinner 
 # sub-voxel surface instead of voxel steps), shifted to the projected mesh's volume.
 ORGANIC_UNPROJECT = True
 MEMBER_TAPER = 1.15  # a member ends at this times its thickest child's radius
+ROOT_REACH = 1.6  # parent radii: a branch's hidden narrow root has grown back by then
 RIB_SMOOTHING = 2.0  # voxels: the ribs are smoothed over this length (surface mode)
 RIB_TRIM = True  # ribs run between junctions (dangling ends trimmed, loose ribs dropped)
 RIB_END_TAPER = 0.4  # open rib ends taper to this share of their radius ...
@@ -2752,23 +2753,57 @@ def taper_members(tree, end_ratio=MEMBER_TAPER, start=0.55) -> list:
 
     A member ending at a split narrows (smoothstep over its last 45%) to
     ``end_ratio`` x its thickest child's radius: the fork grows out of the trunk
-    instead of sitting on a shoulder.
+    instead of sitting on a shoulder. The children's own radii count (``tree.radii``),
+    not their curves' first samples, which may start narrower hidden inside this member.
+    A branch's narrow root (its rising start) reaches the branch's radius within
+    ``ROOT_REACH`` parent radii of its start: no neck after the split on long branches.
     """
     children = {}
-    for e, (a, _b) in enumerate(tree.edges):
+    parent_of = {}
+    for e, (a, b) in enumerate(tree.edges):
         children.setdefault(int(a), []).append(e)
+        parent_of[int(b)] = e
     radii = [np.array(r, dtype=np.float64) for r in tree.curve_radii]
+    nominal = np.asarray(tree.radii, dtype=np.float64)
+    for e, (a, _b) in enumerate(tree.edges):
+        r = radii[e]
+        if tree.kind[a] != 1 or int(a) not in parent_of or r.size < 3:
+            continue
+        flat = np.flatnonzero(np.diff(r) <= 1e-9 * max(float(r.max()), 1e-30))
+        k = int(flat[0]) if flat.size else r.size - 1  # the rising root: samples [0, k]
+        if k == 0:
+            continue
+        curve = np.asarray(tree.curves[e], dtype=np.float64)
+        arc = np.concatenate([[0.0], np.cumsum(np.linalg.norm(np.diff(curve, axis=0), axis=1))])
+        reach = ROOT_REACH * max(float(nominal[parent_of[int(a)]]), 1e-12)
+        w = np.clip(arc[: k + 1] / reach, 0.0, 1.0)
+        grown = nominal[e] * (r[0] / max(float(r[k]), 1e-30)
+                              + (1.0 - r[0] / max(float(r[k]), 1e-30)) * w * w * (3.0 - 2.0 * w))
+        r[: k + 1] = np.maximum(r[: k + 1], np.minimum(grown, r[k]))
     for e, (_a, b) in enumerate(tree.edges):
         kids = children.get(int(b))
         if tree.kind[b] != 1 or not kids:
             continue
         r = radii[e]
-        target = min(float(r[-1]), end_ratio * max(float(radii[k][0]) for k in kids))
+        target = min(float(r[-1]), end_ratio * max(float(nominal[k]) for k in kids))
         s = np.linspace(0.0, 1.0, r.size)
         w = np.clip((s - start) / (1.0 - start), 0.0, 1.0)
         w = w * w * (3.0 - 2.0 * w)
         radii[e] = r * (1.0 - w) + target * w
     return radii
+
+
+def visible_thinnest(tree, radii) -> float:
+    """Thinnest member radius that shows: a branch's rising start (its root, tapered
+    and hidden inside the parent member) does not count."""
+    thinnest = math.inf
+    for (a, _b), r in zip(tree.edges, radii):
+        r = np.asarray(r, dtype=np.float64)
+        if tree.kind[a] == 1 and r.size > 2:
+            flat = np.flatnonzero(np.diff(r) <= 1e-9 * max(float(r.max()), 1e-30))
+            r = r[int(flat[0]) if flat.size else r.size - 1 :]
+        thinnest = min(thinnest, float(np.min(r)))
+    return thinnest
 
 
 def leaf_radii(tree, points) -> np.ndarray:
@@ -2866,7 +2901,7 @@ def branching_geometry(payload, progress, should_stop) -> dict:
         sculpt.Tube(points=curve, radius=r, value=np.full(curve.shape[0], float(force)))
         for curve, r, force in zip(tree.curves, radii, tree.forces)
     ]
-    thinnest = min(float(np.min(r)) for r in radii)
+    thinnest = visible_thinnest(tree, radii)
     voxel = thinnest / max(float(job["detail"]), 1e-3)
     all_points = np.concatenate([np.asarray(t.points) for t in tubes])
     reach = 3.0 * max(float(np.max(r)) for r in radii)
