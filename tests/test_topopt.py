@@ -153,6 +153,7 @@ def test_filter_preserves_constants_inside_the_domain(rmin):
     out = filt.forward(x)
     np.testing.assert_allclose(out[dom], 0.37, rtol=0, atol=1e-14)
     assert np.all(out[~dom] == 0.0)
+    assert np.all(filt.forward(np.ones(dom.shape))[dom] == 1.0)  # solid stays exactly solid
 
 
 def test_filter_never_wraps_around():
@@ -305,9 +306,10 @@ def test_continuation_schedule():
     short = Optimizer(problem, OptSettings(max_iter=6))
     assert short._schedule(3)[0] == 3.0
     assert 1.0 < short._schedule(6)[1] < 3.0
-    # without projection or in RULES mode there is no sharpness
+    # without projection there is no sharpness; RULES has no penalty ramp, only the beta ramp
     assert Optimizer(problem, OptSettings(projection=False))._schedule(30)[1] == 0.0
-    assert Optimizer(problem, OptSettings(mode="RULES"))._schedule(0)[0] == 3.0
+    rules = Optimizer(problem, OptSettings(mode="RULES", max_iter=40))
+    assert rules._schedule(0) == (3.0, 1.0) and rules._schedule(20)[1] == rules.settings.beta_max
     s = topopt.checked_settings(OptSettings(mode="simp", volfrac=1.7, symmetry=[1, 0, 0]))
     assert s.mode == "SIMP" and s.volfrac == 1.0 and s.symmetry == (True, False, False)
 
@@ -364,7 +366,6 @@ def test_zone_bias_attracts_and_repels_material():
     problem.bias = np.where(zone, -1.0, 0.0)
     hollow_opt, _ = run(problem, n_iter=8, volfrac=0.3, max_iter=8)
     assert hollow_opt.x[zone].max() < 1e-12  # b = -1: never material
-    problem.bias = np.where(zone, 1.0, 0.0)
     zone2 = np.zeros(problem.grid.shape, dtype=bool)
     zone2[10:16, :, 3:7] = True  # mid-height band: normally the void core of the beam
     problem.bias = np.where(zone2, 1.0, 0.0)
@@ -426,7 +427,7 @@ def test_should_stop_raises_cancelled_and_keeps_the_last_state():
 
     def stop_soon():
         calls["n"] += 1
-        return calls["n"] > 3  # inside the next solve
+        return calls["n"] > 3  # in the middle of the next step
 
     with pytest.raises(Cancelled):
         opt.run(should_stop=stop_soon)
@@ -497,13 +498,19 @@ def _components(problem, density):
 
 
 def test_support_mode_low_volfrac_gives_one_connected_crisp_structure():
-    problem, _loads, _feet = support_problem(res=22)
-    opt = Optimizer(problem, OptSettings(volfrac=0.08, max_iter=30, rmin=1.5))
-    states = [opt.step() for _ in range(30)]
+    # 8 loads under a floating cube, one footing pad, 8 % of an otherwise empty box
+    problem, _loads, _feet = support_problem(res=18)
+    settings = OptSettings(volfrac=0.08, max_iter=24, continuation_iters=8, rmin=1.5)
+    opt = Optimizer(problem, settings)
+    states = [opt.step() for _ in range(24)]
     final = states[-1]
+    assert final.beta == settings.beta_max and opt.done
     assert abs(final.volume - 0.08) < 1e-3
-    assert final.compliance < states[0].compliance
+    assert final.compliance < 0.7 * states[0].compliance
     _labels, n, pad_labels = _components(problem, final.density)
     assert n == 1  # one piece, no floating islands
-    assert all(lab.tolist() == [1] for lab in pad_labels)  # every pad belongs to it
-    assert final.grey < 0.12
+    assert len(pad_labels) == 9 and all(lab.tolist() == [1] for lab in pad_labels)  # all pads
+    assert final.grey < 0.1  # crisp: little material in 0.1 < rho < 0.9
+    # nothing grows into the carried object (passive void) and the box stays mostly empty
+    assert np.all(final.density[problem.passive_void] == 0.0)
+    assert np.count_nonzero(final.density >= 0.5) < 0.1 * final.density.size

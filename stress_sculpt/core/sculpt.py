@@ -105,6 +105,7 @@ TAU_MAX = 0.25  # soft-max temperature at blend = 1
 _TAU_MIN = 0.005  # below this the union is the exact maximum
 _TAU_ANGLE = 0.1  # fixed temperature of the weights that average the crease angle
 _PAIR_TOL = 1e-9  # pair weight (relative) below which one tube dominates alone
+_MIS_DEAD = 1e-10  # misalignment 1 - cos(theta) treated as parallel (rounding noise)
 _BATCH = 1 << 18  # grid-point evaluations per batch (bounds the temporaries)
 _COLUMN_BATCH = 1 << 18  # grid columns per batch of segments
 _SLAB_CELLS = 1 << 20  # cells per slab of accumulators (8 float64 arrays: 64 MB)
@@ -472,12 +473,24 @@ def _run_starts(keys: np.ndarray) -> np.ndarray:
     return np.flatnonzero(np.concatenate(([True], keys[1:] != keys[:-1])))
 
 
-def _last_max(starts: np.ndarray, f: np.ndarray) -> tuple:
-    """Position of the last maximum of every run ``f[starts[k]:starts[k + 1]]`` and the maxima."""
-    fmax = np.maximum.reduceat(f, starts)
+def _last_max(starts: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Position of the last maximum of every run ``f[starts[k]:starts[k + 1]]``.
+
+    Only runs longer than one element are scanned (usually a small minority).
+    """
     counts = np.diff(np.append(starts, f.size))
-    pos = np.where(f == np.repeat(fmax, counts), np.arange(f.size), -1)
-    return np.maximum.reduceat(pos, starts), fmax
+    multi = np.flatnonzero(counts > 1)
+    pick = starts.copy()
+    if multi.size:
+        m_counts = counts[multi]
+        m_first = np.cumsum(m_counts) - m_counts
+        pos = np.arange(int(m_counts.sum()), dtype=np.int64)
+        pos += np.repeat(starts[multi] - m_first, m_counts)  # positions of the long runs
+        fm = f[pos]
+        best = np.maximum.reduceat(fm, m_first)
+        pos[fm != np.repeat(best, m_counts)] = -1
+        pick[multi] = np.maximum.reduceat(pos, m_first)
+    return pick
 
 
 def _tube_maxima(cell, owner, f, value, direction, open_owner: int) -> tuple:
@@ -499,8 +512,7 @@ def _tube_maxima(cell, owner, f, value, direction, open_owner: int) -> tuple:
     order = np.argsort(keys)
     starts = _run_starts(keys[order])
     if starts.size < order.size:
-        pick, _fmax = _last_max(starts, f[order])
-        order = order[pick]
+        order = order[_last_max(starts, f[order])]
     n_held = 0 if held is None else int(np.count_nonzero(held[order]))
     rows = (
         cell[order],
@@ -518,11 +530,12 @@ class _Accumulator:
     ``tau == 0``: maximum and the value at the maximum. ``tau > 0``: maximum, soft
     sum ``sum(exp(f / tau) - 1)``, weighted value sum, and for the crease angle the
     sums of the angle weights ``w = exp(f / _TAU_ANGLE) - 1``, of ``w ** 2`` and of
-    ``w * direction``.
+    ``w * direction``. The arrays are reused from slab to slab (:meth:`finish`
+    resets the touched cells): fresh pages are expensive to fault in.
     """
 
-    def __init__(self, n: int, base: int, tau: float):
-        self.base = int(base)
+    def __init__(self, n: int, tau: float):
+        self.base = 0
         self.tau = float(tau)
         self.fmax = np.zeros(n)
         self.val = np.zeros(n)
@@ -532,38 +545,53 @@ class _Accumulator:
             self.wsq = np.zeros(n)
             self.wdir = np.zeros((n, 3))
 
+    def start(self, base: int) -> None:
+        """Start a slab whose first cell has flat id ``base`` (accumulators are all zero)."""
+        self.base = int(base)
+
     def add(self, cell, f, value, direction) -> None:
         """Add rows sorted by cell, at most one per (cell, tube), each tube complete."""
         if cell.size == 0:
             return
         starts = _run_starts(cell)
         ucell = cell[starts] - self.base
+        single = starts.size == cell.size  # every cell reached by one tube only
+
+        def total(x):
+            return x if single else np.add.reduceat(x, starts, axis=0)
+
         if self.tau == 0.0:
-            last, fmax = _last_max(starts, f)
+            top = starts if single else _last_max(starts, f)
+            fmax = f[top]
             better = fmax > self.fmax[ucell]
             self.fmax[ucell[better]] = fmax[better]
-            self.val[ucell[better]] = value[last[better]]
+            self.val[ucell[better]] = value[top[better]]
             return
-        self.fmax[ucell] = np.maximum(self.fmax[ucell], np.maximum.reduceat(f, starts))
+        fm = f if single else np.maximum.reduceat(f, starts)
+        self.fmax[ucell] = np.maximum(self.fmax[ucell], fm)
         w = np.expm1(f / self.tau)
-        self.soft[ucell] += np.add.reduceat(w, starts)
+        self.soft[ucell] += total(w)
         w *= value
-        self.val[ucell] += np.add.reduceat(w, starts)
+        self.val[ucell] += total(w)
         wa = np.expm1(f / _TAU_ANGLE)
-        self.wdir[ucell] += np.add.reduceat(direction * wa[:, None], starts, axis=0)
-        self.wsum[ucell] += np.add.reduceat(wa, starts)
+        wa[np.einsum("ij,ij->i", direction, direction) < 0.5] = 0.0  # on an axis: no direction
+        self.wdir[ucell] += total(direction * wa[:, None])
+        self.wsum[ucell] += total(wa)
         wa *= wa
-        self.wsq[ucell] += np.add.reduceat(wa, starts)
+        self.wsq[ucell] += total(wa)
 
     def finish(self, field_out: np.ndarray, value_out: np.ndarray) -> None:
-        """Write the blended field and the value field of the slab."""
+        """Write the blended field and the value field of the slab into the (zero)
+        outputs (only cells reached by a tube are written), then reset."""
+        n = field_out.size
         if self.tau == 0.0:
-            field_out[:] = self.fmax
-            value_out[:] = self.val
+            hit = np.flatnonzero(self.fmax[:n] > 0.0)
+            field_out[hit] = self.fmax[hit]
+            value_out[hit] = self.val[hit]
+            self.fmax[hit] = 0.0
+            self.val[hit] = 0.0
             return
-        field_out[:] = 0.0
-        value_out[:] = 0.0
-        hit = np.flatnonzero(self.soft > 0.0)  # cells reached by some tube
+        hit = np.flatnonzero(self.soft[:n] > 0.0)  # cells reached by some tube
         if hit.size == 0:
             return
         tau = self.tau
@@ -577,12 +605,12 @@ class _Accumulator:
         d = self.wdir[hit]
         spread = W - np.einsum("ij,ij->i", d, d)
         del d
+        for arr in (self.fmax, self.val, self.soft, self.wsum, self.wsq, self.wdir):
+            arr[hit] = 0.0
         mis = np.zeros(hit.size)
         np.divide(spread, pairs, out=mis, where=pairs > _PAIR_TOL * W)
-        np.clip(mis, 0.0, 2.0, out=mis)
         del W, pairs, spread
-        # sin(theta) for theta < 90 deg, else 1 (C1 at 90 deg)
-        g = np.where(mis >= 1.0, 1.0, np.sqrt(np.maximum(mis * (2.0 - mis), 0.0)))
+        g = _crease_factor(mis)
         del mis
         # soft maximum G of the other tubes, kept below F + g (G - F) as g vanishes
         rest = (1.0 + S) - np.exp(F / tau)
@@ -599,11 +627,23 @@ class _Accumulator:
         field_out[hit] = _soft_max2(F, G, g)
 
 
+def _crease_factor(mis: np.ndarray) -> np.ndarray:
+    """Temperature factor ``sin(theta)`` (1 beyond 90 degrees) of a crease whose gradients
+    are misaligned by ``mis = 1 - cos(theta)``; C1 at 90 degrees. Misalignments below
+    ``_MIS_DEAD`` (rounding noise of identical directions) count as parallel."""
+    m = np.clip(np.asarray(mis, dtype=np.float64) - _MIS_DEAD, 0.0, 2.0)
+    return np.where(m >= 1.0, 1.0, np.sqrt(m * (2.0 - m)))
+
+
 def _soft_max2(a: np.ndarray, b: np.ndarray, t) -> np.ndarray:
     """``t * ln(exp(a / t) + exp(b / t) - 1)`` (overflow free; the maximum where ``t <= 0``)."""
+    a, b, t = np.broadcast_arrays(
+        np.asarray(a, dtype=np.float64), np.asarray(b, dtype=np.float64), np.asarray(t, dtype=np.float64)
+    )
+    shape = a.shape
+    a, b, t = (x.reshape(-1) for x in (a, b, t))
     hi = np.maximum(a, b)
     lo = np.minimum(a, b)
-    t = np.broadcast_to(np.asarray(t, dtype=np.float64), hi.shape)
     pos = t > 0.0
     safe = np.where(pos, t, 1.0)
     with np.errstate(under="ignore", over="ignore"):
@@ -614,7 +654,7 @@ def _soft_max2(a: np.ndarray, b: np.ndarray, t) -> np.ndarray:
     extra *= t
     extra[~pos] = 0.0
     extra += hi
-    return extra
+    return extra.reshape(shape)
 
 
 def _aligned_end(end: int, start: int, first_of_run: np.ndarray, owner: np.ndarray) -> int:
@@ -668,11 +708,12 @@ def _field_on_grid(seg, shape, origin, h, tau, progress, should_stop) -> tuple:
     in_grid = np.all((box_hi >= 0) & (box_lo <= hi_grid), axis=1)
     slabs = list(range(0, shape[0], thick))
     with_dir = tau > 0.0
+    acc = _Accumulator(min(thick, shape[0]) * layer, tau)
     for s_index, x0 in enumerate(slabs):
         x1 = min(x0 + thick, shape[0])
         check_stop(should_stop)
         ids = np.flatnonzero(in_grid & (box_lo[:, 0] < x1) & (box_hi[:, 0] >= x0))
-        acc = _Accumulator((x1 - x0) * layer, x0 * layer, tau)
+        acc.start(x0 * layer)
         if ids.size:
             lo_clip = np.array([x0, 0, 0], dtype=np.int64)
             hi_clip = np.array([x1 - 1, shape[1] - 1, shape[2] - 1], dtype=np.int64)
@@ -716,7 +757,6 @@ def _field_on_grid(seg, shape, origin, h, tau, progress, should_stop) -> tuple:
                 acc.add(carry[0], carry[2], carry[3], carry[4])
         sl = slice(x0 * layer, x1 * layer)
         acc.finish(field[sl], value[sl])
-        del acc
     return field.reshape(shape), value.reshape(shape)
 
 
@@ -860,13 +900,14 @@ def union_fields(a, b, blend) -> np.ndarray:
     """Smooth union of two non-negative fields with the rule of :func:`tubes_field`.
 
     ``U = tau' ln(exp(a / tau') + exp(b / tau') - 1)`` with ``tau' = TAU_MAX * blend *
-    sin(theta)`` (``theta`` = angle between the central-difference gradients of ``a``
-    and ``b``, capped at 90 degrees; flat spots count as 90), the maximum for
-    ``blend = 0``. So ``max(a, b) <= U <= soft-max``, ``U(a, 0) = a`` exactly,
-    ``U(a, b) = U(b, a)``, non-decreasing in ``blend``; fillets where the surfaces
-    cross, no swelling where they overlap with parallel gradients. Both fields
-    must be sampled on the same regular grid (same spacing on every axis);
-    negative inputs count as 0. Arrays broadcast; returns float64.
+    sin(theta)``, ``theta`` = angle between the central-difference gradients of ``a``
+    and ``b`` (capped at 90 degrees): the maximum for ``blend = 0`` and wherever a
+    gradient vanishes (no direction, like a point on a tube's axis; also for inputs
+    without any axis of two or more samples). So ``max(a, b) <= U <= soft-max``,
+    ``U(a, 0) = a`` exactly, ``U(a, b) = U(b, a)``, non-decreasing in ``blend``;
+    fillets where the surfaces cross, no swelling where they overlap with parallel
+    gradients. Both fields must be sampled on the same regular grid (same spacing
+    on every axis); negative inputs count as 0. Arrays broadcast; returns float64.
     """
     tau = blend_tau(blend)
     a = np.asarray(a, dtype=np.float64)
@@ -875,13 +916,10 @@ def union_fields(a, b, blend) -> np.ndarray:
     out = np.empty(a.shape, dtype=np.float64)
     if out.size == 0:
         return out
-    if tau == 0.0:
+    axes = tuple(ax for ax in range(out.ndim) if out.shape[ax] >= 2)
+    if tau == 0.0 or not axes:
         out[...] = np.maximum(np.maximum(a, b), 0.0)
         return out
-    if out.ndim == 0:  # no gradient: the plain soft maximum
-        out[...] = _soft_max2(np.maximum(a, 0.0), np.maximum(b, 0.0), tau)
-        return out
-    axes = tuple(ax for ax in range(out.ndim) if out.shape[ax] >= 2)
     n0 = out.shape[0]
     per_row = max(1, out.size // n0)
     step = max(1, _UNION_BLOCK // per_row)
@@ -892,11 +930,12 @@ def union_fields(a, b, blend) -> np.ndarray:
         x = np.maximum(a[h0:h1], 0.0)
         y = np.maximum(b[h0:h1], 0.0)
         inner = slice(s0 - h0, s0 - h0 + (s1 - s0))
-        if axes:
-            cos = np.einsum("i...,i...->...", _unit_gradient(x, axes), _unit_gradient(y, axes))[inner]
-            mis = np.clip(1.0 - cos, 0.0, 2.0)
-            g = np.where(mis >= 1.0, 1.0, np.sqrt(np.maximum(mis * (2.0 - mis), 0.0)))
-        else:
-            g = 1.0
-        out[s0:s1] = _soft_max2(x[inner], y[inner], g * tau)
+        nx = _unit_gradient(x, axes)[(slice(None), inner)]
+        ny = _unit_gradient(y, axes)[(slice(None), inner)]
+        defined = (np.einsum("i...,i...->...", nx, nx) > 0.5) & (np.einsum("i...,i...->...", ny, ny) > 0.5)
+        mis = np.where(defined, 1.0 - np.einsum("i...,i...->...", nx, ny), 0.0)
+        del nx, ny, defined
+        g = _crease_factor(mis)
+        g *= tau
+        out[s0:s1] = _soft_max2(x[inner], y[inner], g)
     return out

@@ -58,6 +58,12 @@ design variables are averaged after every update and the physical density is
 averaged at the end of the forward chain, so a symmetric problem gives an exactly
 (bitwise) symmetric density.
 
+Cost: an iteration is one warm-started FE solve (two in the first step, which also
+analyzes the initial design) plus ~0.1 s of filtering, root finding and stress
+recovery. Measured on 4 cores for a SUPPORT-mode box of 44 x 44 x 34 = 66k elements
+at 5 % material: ~20 MG-PCG iterations to the 1e-4 residual, 3 - 4 s per iteration
+(of which ~0.8 s is the multigrid set-up the solver redoes for every new density).
+
 Conventions as in ``core/grid.py``: grid-shaped arrays are ``(nx, ny, nz)`` and
 zero outside the domain; per-element FE arrays follow ``FEModel.elems`` (C-order of
 the domain). Pure numpy (float64), no global mutable state: independent optimizers
@@ -307,7 +313,8 @@ class DensityFilter:
         self._mask = domain.astype(np.float64)
         norm = self._convolve(self._mask)
         self.norm = np.where(domain, norm, 0.0)  # weighted neighbour count (domain only)
-        self._inv_norm = np.where(domain, 1.0 / np.where(domain, norm, 1.0), 0.0)
+        self._norm_safe = np.where(domain, norm, 1.0)
+        self._inv_norm = self._mask / self._norm_safe
 
     @property
     def n_neighbours(self) -> int:
@@ -344,7 +351,10 @@ class DensityFilter:
     def forward(self, x_grid) -> np.ndarray:
         """Filtered field (nx, ny, nz); values of ``x_grid`` outside the domain are ignored."""
         x = self._checked(x_grid)
-        return self._convolve(x * self._mask) * self._inv_norm
+        out = self._convolve(x * self._mask)
+        out /= self._norm_safe  # a division keeps an all-ones field exactly 1
+        out *= self._mask
+        return out
 
     def backward(self, dx_grid) -> np.ndarray:
         """Adjoint of :meth:`forward`: gradient w.r.t. ``x`` from a gradient w.r.t. ``F x``."""
@@ -775,7 +785,8 @@ class Optimizer:
 
         Returns the new :class:`IterationState` (also kept as ``self.state``).
         Raises :class:`~.grid.Cancelled` when ``should_stop()`` returns True; the
-        optimizer then stays at its last completed iteration.
+        optimizer then stays at its last completed iteration. Stepping past
+        :attr:`done` keeps iterating with the final continuation parameters.
         """
         t_start = time.perf_counter()
         check_stop(should_stop)
